@@ -1,0 +1,106 @@
+package dev.bgame.lanplus.backend;
+
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.regex.Pattern;
+import java.util.stream.Stream;
+
+final class AssetCatalog {
+
+    static final int MAX_BYTES = 512 * 1024;
+    private static final Pattern ID = Pattern.compile("[a-z0-9_-]{1,64}");
+
+    private final Path dir;
+    private final String urlPrefix;
+    private final Map<String, AssetHash.Cached> hashes = new HashMap<>();
+
+    AssetCatalog(Path dir, String urlPrefix) {
+        this.dir = dir;
+        this.urlPrefix = urlPrefix;
+    }
+
+    synchronized List<Map<String, Object>> list() {
+        List<Map<String, Object>> out = new ArrayList<>();
+        if (!Files.isDirectory(dir)) {
+            return out;
+        }
+        List<String> ids = new ArrayList<>();
+        try (Stream<Path> files = Files.list(dir)) {
+            files.forEach(p -> {
+                String name = p.getFileName().toString();
+                if (name.endsWith(".png")) {
+                    ids.add(name.substring(0, name.length() - ".png".length()));
+                }
+            });
+        } catch (IOException e) {
+            return out;
+        }
+        ids.sort(String::compareTo);
+        for (String id : ids) {
+            String hash = hash(id);
+            if (hash != null) {
+                Map<String, Object> m = new LinkedHashMap<>();
+                m.put("id", id);
+                m.put("url", urlPrefix + id + ".png");
+                m.put("hash", hash);
+                out.add(m);
+            }
+        }
+        return out;
+    }
+
+    synchronized boolean has(String id) {
+        return hash(id) != null;
+    }
+
+    synchronized String url(String id) {
+        return urlPrefix + id + ".png";
+    }
+
+    synchronized String hash(String id) {
+        return AssetHash.cached(fileOf(id), id, hashes, MAX_BYTES);
+    }
+
+    synchronized byte[] png(String id) {
+        if (hash(id) == null) {
+            return null;
+        }
+        try {
+            return Files.readAllBytes(fileOf(id));
+        } catch (IOException e) {
+            return null;
+        }
+    }
+
+    static boolean validId(String id) {
+        return id != null && ID.matcher(id).matches();
+    }
+
+    synchronized String write(String id, byte[] bytes) {
+        Path file = fileOf(id);
+        if (file == null || bytes == null || bytes.length == 0 || bytes.length > MAX_BYTES) {
+            return null;
+        }
+        try {
+            Files.createDirectories(dir);
+            Files.write(file, bytes);
+            hashes.remove(id);
+            return hash(id);
+        } catch (IOException e) {
+            return null;
+        }
+    }
+
+    private Path fileOf(String id) {
+        if (id == null || !ID.matcher(id).matches()) {
+            return null;
+        }
+        return dir.resolve(id + ".png");
+    }
+}

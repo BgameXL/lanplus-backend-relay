@@ -1,0 +1,3114 @@
+package dev.bgame.lanplus.backend;
+
+import java.net.URI;
+import java.net.URLEncoder;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.SecureRandom;
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.sql.Statement;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.ConcurrentHashMap;
+
+/**
+ * Backend state. Durable identity and social graph lives in SQLite;
+ * presence, invites, and relay tickets stay in memory because they are ephemeral and correct to lose on restart.
+ *
+ */
+final class Store {
+
+    private static final String[] WORDS = {
+            "creeper", "diamond", "enderman", "blaze", "slime", "ghast", "zombie", "redstone", "emerald", "copper",
+            "amethyst", "sculk", "warden", "allay", "axolotl", "beacon", "lantern", "mangrove", "cobble", "nether",
+            "elytra", "trident", "totem", "dripstone", "glowstone", "bastion", "honey", "golden", "obsidian", "netherite"
+    };
+    private static final SecureRandom RNG = new SecureRandom();
+
+    static final class User {
+        final UUID uuid;
+        final String username;
+        final String friendCode;
+        final String domain;
+
+        User(UUID uuid, String username, String friendCode, String domain) {
+            this.uuid = uuid;
+            this.username = username;
+            this.friendCode = friendCode;
+            this.domain = domain;
+        }
+    }
+
+    static final class Presence {
+        volatile String state;
+        volatile String worldName;
+        volatile String address;
+        volatile String joinCode;
+        volatile Object skin;
+        volatile Object persistedSkin;
+        volatile String modpackId;
+        volatile String accessMode;
+        volatile Set<UUID> allowedUuids = Set.of();
+        volatile String gameMode;
+        volatile String difficulty;
+        volatile boolean allowCommands;
+        volatile long lastHeartbeat;
+        volatile boolean hosting;
+        volatile boolean hostingAnnounced;
+        volatile boolean onlinePersisted;
+        volatile boolean disconnectRecorded;
+    }
+
+    record Ticket(UUID uuid, String domain, boolean requireToken, long expiresAt) {
+    }
+
+    record Invite(UUID hostUuid, String address, String worldName, long expiresAt) {
+    }
+
+    record GuestToken(String hostDomain, long expiresAt) {
+    }
+
+    record Session(UUID uuid, boolean verified) {
+    }
+
+    record AuthResult(String token, UUID uuid, boolean verified, long expiresInSeconds) {
+    }
+
+    enum AddResult {ACCEPTED, REQUESTED, BLOCKED}
+
+    private static final long CHALLENGE_TTL_MS = 60_000;
+
+    private final long ttlMs;
+    private final String baseDomain;
+    private final String sessionServerUrl;
+    private final boolean allowOffline;
+    private final long sessionTtlMs;
+    private final HttpClient httpClient = HttpClient.newBuilder()
+            .connectTimeout(Duration.ofSeconds(5))
+            .build();
+
+    private static final int READER_POOL = 8;
+    private static final int SUGGESTIONS_LIMIT = 10;
+    private static final int MUTUAL_NAMES_SHOWN = 3;
+
+    private final Object lock = new Object();
+    private final Connection connection;
+    private final BlockingQueue<Connection> readers;
+    private final ThreadLocal<Connection> readConn = new ThreadLocal<>();
+    private final AssetCatalog backgrounds;
+    private final AssetCatalog banners;
+    private final AssetCatalog announcementImages;
+    private final String discordWebhook;
+
+    private final Map<UUID, Presence> presences = new ConcurrentHashMap<>();
+    private final Map<String, Invite> invites = new ConcurrentHashMap<>();
+    private final Map<String, Ticket> tickets = new ConcurrentHashMap<>();
+    private final Map<String, GuestToken> guestTokens = new ConcurrentHashMap<>();
+    private final Map<String, Long> challenges = new ConcurrentHashMap<>(); // serverId -> expiresAt
+
+    Store(long ttlMs, String baseDomain, String dataFile,
+          String sessionServerUrl, boolean allowOffline, long sessionTtlMs,
+          AssetCatalog backgrounds, AssetCatalog banners, AssetCatalog announcementImages,
+          String discordWebhook) {
+        this.ttlMs = ttlMs;
+        this.baseDomain = baseDomain;
+        this.sessionServerUrl = sessionServerUrl;
+        this.allowOffline = allowOffline;
+        this.sessionTtlMs = sessionTtlMs;
+        this.backgrounds = backgrounds;
+        this.banners = banners;
+        this.announcementImages = announcementImages;
+        this.discordWebhook = discordWebhook;
+        String path = (dataFile == null || dataFile.isBlank()) ? ":memory:" : dataFile;
+        this.connection = openDb(path);
+        this.readers = openReaders(path);
+    }
+
+    private static String jdbcUrl(String path) {
+        if (":memory:".equals(path)) {
+            return "jdbc:sqlite:file:lanplus_shared_mem?mode=memory&cache=shared";
+        }
+        return "jdbc:sqlite:" + path;
+    }
+
+    private static BlockingQueue<Connection> openReaders(String path) {
+        BlockingQueue<Connection> pool = new ArrayBlockingQueue<>(READER_POOL);
+        try {
+            for (int i = 0; i < READER_POOL; i++) {
+                Connection c = DriverManager.getConnection(jdbcUrl(path));
+                try (Statement st = c.createStatement()) {
+                    st.execute("PRAGMA busy_timeout=5000");
+                    st.execute("PRAGMA foreign_keys=ON");
+                    st.execute("PRAGMA cache_size=-1024");
+                    st.execute("PRAGMA query_only=true");
+                }
+                pool.add(c);
+            }
+        } catch (SQLException e) {
+            throw new IllegalStateException("LAN+ backend: failed to open reader pool", e);
+        }
+        return pool;
+    }
+
+    private Connection conn() {
+        Connection c = readConn.get();
+        return c != null ? c : connection;
+    }
+
+    private interface Reader extends AutoCloseable {
+        @Override
+        void close();
+    }
+
+    private Reader read() {
+        if (readConn.get() != null) {
+            return () -> {
+            };
+        }
+        Connection c;
+        try {
+            c = readers.take();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("LAN+ backend: interrupted waiting for reader", e);
+        }
+        readConn.set(c);
+        return () -> {
+            readConn.remove();
+            readers.add(c);
+        };
+    }
+
+    private static Connection openDb(String path) {
+        try {
+            Class.forName("org.sqlite.JDBC");
+            Connection c = DriverManager.getConnection(jdbcUrl(path));
+            try (Statement st = c.createStatement()) {
+                st.execute("PRAGMA journal_mode=WAL");
+                st.execute("PRAGMA synchronous=NORMAL");
+                st.execute("PRAGMA foreign_keys=ON");
+                st.execute("PRAGMA busy_timeout=5000");
+                st.executeUpdate("CREATE TABLE IF NOT EXISTS users ("
+                        + "uuid TEXT PRIMARY KEY, username TEXT, friend_code TEXT UNIQUE NOT NULL, "
+                        + "domain TEXT UNIQUE NOT NULL, last_modpack TEXT)");
+                st.executeUpdate("CREATE TABLE IF NOT EXISTS friends ("
+                        + "a TEXT NOT NULL, b TEXT NOT NULL, PRIMARY KEY (a, b), CHECK (a < b))");
+                st.executeUpdate("CREATE TABLE IF NOT EXISTS friend_requests ("
+                        + "from_uuid TEXT NOT NULL, to_uuid TEXT NOT NULL, PRIMARY KEY (from_uuid, to_uuid))");
+                st.executeUpdate("CREATE TABLE IF NOT EXISTS relationships ("
+                        + "uuid TEXT NOT NULL, target TEXT NOT NULL, muted INTEGER NOT NULL DEFAULT 0, "
+                        + "blocked INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (uuid, target))");
+                st.executeUpdate("CREATE TABLE IF NOT EXISTS profile_bio ("
+                        + "uuid TEXT PRIMARY KEY, text TEXT NOT NULL DEFAULT '', updated_at INTEGER NOT NULL)");
+                st.executeUpdate("CREATE TABLE IF NOT EXISTS profile_identity ("
+                        + "uuid TEXT PRIMARY KEY, pronouns TEXT)");
+                st.executeUpdate("CREATE TABLE IF NOT EXISTS profile_links ("
+                        + "uuid TEXT PRIMARY KEY, discord TEXT, instagram TEXT, twitter TEXT, youtube TEXT, "
+                        + "twitch TEXT, tiktok TEXT, paypal TEXT, kofi TEXT)");
+                st.executeUpdate("CREATE TABLE IF NOT EXISTS profile_privacy ("
+                        + "uuid TEXT PRIMARY KEY, invisible_mode INTEGER NOT NULL DEFAULT 0, "
+                        + "discoverable INTEGER NOT NULL DEFAULT 1, "
+                        + "profile_public INTEGER NOT NULL DEFAULT 0)");
+                st.executeUpdate("CREATE TABLE IF NOT EXISTS profile_prompts ("
+                        + "uuid TEXT NOT NULL, prompt_id TEXT NOT NULL, answer TEXT NOT NULL, "
+                        + "updated_at INTEGER NOT NULL, PRIMARY KEY (uuid, prompt_id))");
+                st.executeUpdate("CREATE TABLE IF NOT EXISTS modpack_registry ("
+                        + "modpack_id TEXT PRIMARY KEY, name TEXT NOT NULL, icon_url TEXT, author TEXT, "
+                        + "team TEXT, download_url TEXT, description TEXT)");
+                st.executeUpdate("CREATE TABLE IF NOT EXISTS profile_settings ("
+                        + "uuid TEXT PRIMARY KEY, favorite_modpack_id TEXT, "
+                        + "favorite_modpack_visible INTEGER NOT NULL DEFAULT 1, "
+                        + "recently_played_visible INTEGER NOT NULL DEFAULT 1, "
+                        + "currently_playing_visible INTEGER NOT NULL DEFAULT 1, "
+                        + "bg_style TEXT, bg_color INTEGER, bg_opacity INTEGER, "
+                        + "bg_image_id TEXT, banner_id TEXT, "
+                        + "updated_at INTEGER NOT NULL)");
+                st.executeUpdate("CREATE TABLE IF NOT EXISTS presence_state ("
+                        + "uuid TEXT PRIMARY KEY, online INTEGER NOT NULL DEFAULT 0, last_disconnect_at INTEGER)");
+                st.executeUpdate("CREATE TABLE IF NOT EXISTS xp_events ("
+                        + "id INTEGER PRIMARY KEY AUTOINCREMENT, uuid TEXT NOT NULL, source TEXT NOT NULL, "
+                        + "amount INTEGER NOT NULL, detail TEXT, created_at INTEGER NOT NULL)");
+                st.executeUpdate("CREATE INDEX IF NOT EXISTS idx_xp_events_uuid ON xp_events(uuid)");
+                st.executeUpdate("CREATE TABLE IF NOT EXISTS xp_totals ("
+                        + "uuid TEXT NOT NULL, source TEXT NOT NULL, total INTEGER NOT NULL DEFAULT 0, "
+                        + "updated_at INTEGER NOT NULL, PRIMARY KEY (uuid, source))");
+                st.executeUpdate("CREATE INDEX IF NOT EXISTS idx_xp_totals_uuid ON xp_totals(uuid)");
+                migrateXpTotalsLocked(st);
+                st.executeUpdate("CREATE TABLE IF NOT EXISTS advancements ("
+                        + "uuid TEXT NOT NULL, advancement_id TEXT NOT NULL, earned_at INTEGER NOT NULL, "
+                        + "PRIMARY KEY (uuid, advancement_id))");
+                st.executeUpdate("CREATE TABLE IF NOT EXISTS advancement_xp_window ("
+                        + "uuid TEXT NOT NULL, window_start INTEGER NOT NULL, count INTEGER NOT NULL DEFAULT 0, "
+                        + "PRIMARY KEY (uuid, window_start))");
+                st.executeUpdate("CREATE TABLE IF NOT EXISTS playtime ("
+                        + "uuid TEXT NOT NULL, modpack_id TEXT NOT NULL, seconds INTEGER NOT NULL DEFAULT 0, "
+                        + "updated_at INTEGER NOT NULL, PRIMARY KEY (uuid, modpack_id))");
+                st.executeUpdate("CREATE TABLE IF NOT EXISTS social_time ("
+                        + "uuid TEXT PRIMARY KEY, seconds INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL)");
+                st.executeUpdate("CREATE TABLE IF NOT EXISTS user_skin ("
+                        + "uuid TEXT PRIMARY KEY, skin_json TEXT NOT NULL, updated_at INTEGER NOT NULL)");
+                st.executeUpdate("CREATE TABLE IF NOT EXISTS skin_data ("
+                        + "uuid TEXT PRIMARY KEY, png BLOB NOT NULL, hash TEXT NOT NULL, model TEXT, "
+                        + "updated_at INTEGER NOT NULL)");
+                st.executeUpdate("CREATE TABLE IF NOT EXISTS skin_library ("
+                        + "uuid TEXT NOT NULL, skin_id TEXT NOT NULL, png BLOB NOT NULL, model TEXT, "
+                        + "created_at INTEGER NOT NULL, PRIMARY KEY (uuid, skin_id))");
+                st.executeUpdate("CREATE TABLE IF NOT EXISTS cosmetic_loadout ("
+                        + "uuid TEXT NOT NULL, slot TEXT NOT NULL, cosmetic_id TEXT NOT NULL, "
+                        + "equipped_at INTEGER NOT NULL, PRIMARY KEY (uuid, slot))");
+                st.executeUpdate("CREATE TABLE IF NOT EXISTS cosmetic_ownership ("
+                        + "uuid TEXT NOT NULL, cosmetic_id TEXT NOT NULL, cost INTEGER NOT NULL DEFAULT 0, "
+                        + "purchased_at INTEGER NOT NULL, PRIMARY KEY (uuid, cosmetic_id))");
+                st.executeUpdate("CREATE TABLE IF NOT EXISTS sessions ("
+                        + "token_hash TEXT PRIMARY KEY, uuid TEXT NOT NULL, verified INTEGER NOT NULL DEFAULT 0, "
+                        + "created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL)");
+                st.executeUpdate("CREATE INDEX IF NOT EXISTS idx_sessions_uuid ON sessions(uuid)");
+                st.executeUpdate("CREATE TABLE IF NOT EXISTS meta ("
+                        + "key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+                if (columnExists(st, "users", "last_seen")) {
+                    st.executeUpdate("ALTER TABLE users DROP COLUMN last_seen");
+                }
+                if (columnExists(st, "profile_settings", "most_played_visible")) {
+                    st.executeUpdate("ALTER TABLE profile_settings "
+                            + "RENAME COLUMN most_played_visible TO recently_played_visible");
+                }
+                if (!columnExists(st, "profile_settings", "bg_style")) {
+                    st.executeUpdate("ALTER TABLE profile_settings ADD COLUMN bg_style TEXT");
+                    st.executeUpdate("ALTER TABLE profile_settings ADD COLUMN bg_color INTEGER");
+                    st.executeUpdate("ALTER TABLE profile_settings ADD COLUMN bg_opacity INTEGER");
+                }
+                if (!columnExists(st, "profile_settings", "bg_image_id")) {
+                    st.executeUpdate("ALTER TABLE profile_settings ADD COLUMN bg_image_id TEXT");
+                    st.executeUpdate("ALTER TABLE profile_settings ADD COLUMN banner_id TEXT");
+                }
+                if (!columnExists(st, "users", "banned")) {
+                    st.executeUpdate("ALTER TABLE users ADD COLUMN banned INTEGER NOT NULL DEFAULT 0");
+                    st.executeUpdate("ALTER TABLE users ADD COLUMN ban_reason TEXT");
+                }
+                if (!columnExists(st, "profile_privacy", "discoverable")) {
+                    st.executeUpdate("ALTER TABLE profile_privacy ADD COLUMN discoverable INTEGER NOT NULL DEFAULT 1");
+                }
+                if (!columnExists(st, "profile_privacy", "profile_public")) {
+                    st.executeUpdate("ALTER TABLE profile_privacy ADD COLUMN profile_public INTEGER NOT NULL DEFAULT 0");
+                }
+                st.executeUpdate("CREATE TABLE IF NOT EXISTS reports ("
+                        + "id INTEGER PRIMARY KEY AUTOINCREMENT, reporter_uuid TEXT NOT NULL, "
+                        + "target_uuid TEXT NOT NULL, reason TEXT, status TEXT NOT NULL DEFAULT 'open', "
+                        + "created_at INTEGER NOT NULL)");
+                st.executeUpdate("CREATE INDEX IF NOT EXISTS idx_reports_status ON reports(status)");
+                st.executeUpdate("CREATE TABLE IF NOT EXISTS activity ("
+                        + "id INTEGER PRIMARY KEY AUTOINCREMENT, actor_uuid TEXT NOT NULL, "
+                        + "type TEXT NOT NULL, subject TEXT, created_at INTEGER NOT NULL)");
+                st.executeUpdate("CREATE INDEX IF NOT EXISTS idx_activity_actor "
+                        + "ON activity(actor_uuid, created_at)");
+                st.executeUpdate("CREATE TABLE IF NOT EXISTS social_pair ("
+                        + "a TEXT NOT NULL, b TEXT NOT NULL, sessions INTEGER NOT NULL DEFAULT 0, "
+                        + "last_at INTEGER NOT NULL, PRIMARY KEY (a, b))");
+                st.executeUpdate("CREATE TABLE IF NOT EXISTS announcements ("
+                        + "id INTEGER PRIMARY KEY AUTOINCREMENT, type TEXT NOT NULL, title TEXT NOT NULL, "
+                        + "body TEXT NOT NULL, created_at INTEGER NOT NULL, active INTEGER NOT NULL DEFAULT 1)");
+                st.executeUpdate("CREATE INDEX IF NOT EXISTS idx_announcements_active "
+                        + "ON announcements(active, created_at)");
+                st.executeUpdate("CREATE TABLE IF NOT EXISTS announcement_seen ("
+                        + "user_uuid TEXT NOT NULL, announcement_id INTEGER NOT NULL, "
+                        + "PRIMARY KEY (user_uuid, announcement_id), "
+                        + "FOREIGN KEY (announcement_id) REFERENCES announcements(id))");
+                if (!columnExists(st, "announcements", "image_id")) {
+                    st.executeUpdate("ALTER TABLE announcements ADD COLUMN image_id TEXT");
+                }
+                st.executeUpdate("UPDATE presence_state SET online=0");
+            }
+            return c;
+        } catch (ClassNotFoundException | SQLException e) {
+            throw new IllegalStateException("LAN+ backend: cannot open SQLite database at " + path, e);
+        }
+    }
+
+    private static boolean columnExists(Statement st, String table, String column) throws SQLException {
+        try (ResultSet rs = st.executeQuery("PRAGMA table_info(" + table + ")")) {
+            while (rs.next()) {
+                if (column.equals(rs.getString("name"))) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    void close() {
+        synchronized (lock) {
+            try {
+                connection.close();
+            } catch (SQLException ignored) {
+            }
+        }
+        Connection c;
+        while ((c = readers.poll()) != null) {
+            try {
+                c.close();
+            } catch (SQLException ignored) {
+            }
+        }
+    }
+
+    // users
+    User ensureUser(UUID uuid, String username) {
+        if (username != null) {
+            username = safeName(uuid, username);
+        }
+        synchronized (lock) {
+            try {
+                User u = findUser(uuid);
+                if (u == null) {
+                    String friendCode = uniqueFriendCode();
+                    String domain = uniqueDomain();
+                    try (PreparedStatement ps = conn().prepareStatement(
+                            "INSERT INTO users (uuid, username, friend_code, domain) VALUES (?,?,?,?)")) {
+                        ps.setString(1, uuid.toString());
+                        ps.setString(2, username);
+                        ps.setString(3, friendCode);
+                        ps.setString(4, domain);
+                        ps.executeUpdate();
+                    }
+                    markAllAnnouncementsSeenLocked(uuid.toString());
+                    return new User(uuid, username, friendCode, domain);
+                }
+                if (username != null && !username.isBlank() && !username.equals(u.username)) {
+                    try (PreparedStatement ps = conn().prepareStatement(
+                            "UPDATE users SET username=? WHERE uuid=?")) {
+                        ps.setString(1, username);
+                        ps.setString(2, uuid.toString());
+                        ps.executeUpdate();
+                    }
+                    return new User(uuid, username, u.friendCode, u.domain);
+                }
+                return u;
+            } catch (SQLException e) {
+                throw fail("ensureUser", e);
+            }
+        }
+    }
+
+    Map<String, Object> me(UUID uuid) {
+        User u = ensureUser(uuid, null);
+        return ordered("uuid", uuid.toString(), "username", u.username == null ? "Player" : u.username,
+                "friendCode", u.friendCode);
+    }
+
+    Map<String, Object> resolve(String query) {
+        if (query == null || query.isBlank()) {
+            return null;
+        }
+        try (Reader r = read()) {
+            try (PreparedStatement ps = conn().prepareStatement(
+                    "SELECT uuid, username FROM users WHERE (friend_code = ? COLLATE NOCASE "
+                            + "OR username = ? COLLATE NOCASE) AND banned = 0 LIMIT 1")) {
+                ps.setString(1, query);
+                ps.setString(2, query);
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (rs.next()) {
+                        UUID uuid = UUID.fromString(rs.getString(1));
+                        return ordered("uuid", rs.getString(1), "username", rs.getString(2),
+                                "online", isOnline(uuid));
+                    }
+                }
+            } catch (SQLException e) {
+                throw fail("resolve", e);
+            }
+        }
+        return null;
+    }
+
+    Object skinByName(String name) {
+        if (name == null || name.isBlank()) {
+            return null;
+        }
+        try (Reader r = read()) {
+            try (PreparedStatement ps = conn().prepareStatement(
+                    "SELECT s.skin_json FROM users u JOIN user_skin s ON s.uuid = u.uuid "
+                            + "WHERE u.username = ? COLLATE NOCASE AND u.banned = 0 LIMIT 1")) {
+                ps.setString(1, name);
+                try (ResultSet rs = ps.executeQuery()) {
+                    return rs.next() ? Json.parse(rs.getString(1)) : null;
+                }
+            } catch (SQLException e) {
+                throw fail("skinByName", e);
+            }
+        }
+    }
+
+    List<Object> search(String q) {
+        List<Object> out = new ArrayList<>();
+        if (q == null || q.isBlank()) {
+            return out;
+        }
+        try (Reader r = read()) {
+            try (PreparedStatement ps = conn().prepareStatement(
+                    "SELECT uuid, username, friend_code FROM users WHERE (username LIKE ? COLLATE NOCASE "
+                            + "OR friend_code LIKE ? COLLATE NOCASE) AND banned = 0")) {
+                String like = "%" + q + "%";
+                ps.setString(1, like);
+                ps.setString(2, like);
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        UUID uuid = UUID.fromString(rs.getString(1));
+                        out.add(ordered("uuid", rs.getString(1), "username", rs.getString(2),
+                                "friendCode", rs.getString(3), "online", isOnline(uuid)));
+                    }
+                }
+            } catch (SQLException e) {
+                throw fail("search", e);
+            }
+        }
+        return out;
+    }
+
+    // presence
+    boolean upsertPresence(UUID uuid, String username, String state, String worldName,
+                           String address, String joinCode, Object skin, String modpackId,
+                           String accessMode, Set<UUID> allowedUuids,
+                           String gameMode, String difficulty, boolean allowCommands) {
+        ensureUser(uuid, username);
+        Presence p = presences.computeIfAbsent(uuid, k -> new Presence());
+        long now = System.currentTimeMillis();
+        long prevHeartbeat = p.lastHeartbeat;
+        String prevModpackId = p.modpackId;
+        boolean wasOnline = p.onlinePersisted;
+        p.state = state;
+        p.worldName = worldName;
+        p.address = address;
+        p.joinCode = joinCode;
+        p.skin = skin;
+        p.modpackId = modpackId;
+        p.accessMode = accessMode;
+        p.allowedUuids = allowedUuids == null ? Set.of() : allowedUuids;
+        p.gameMode = gameMode;
+        p.difficulty = difficulty;
+        p.allowCommands = allowCommands;
+        p.lastHeartbeat = now;
+        p.hosting = "HOSTING".equals(state);
+        if (p.hosting && joinCode != null) {
+            renewInvite(joinCode, now + 3_600_000);
+        }
+        if (!p.onlinePersisted) {
+            p.onlinePersisted = true;
+            p.disconnectRecorded = false;
+            markOnline(uuid);
+        }
+        if (wasOnline && prevHeartbeat > 0) {
+            long delta = now - prevHeartbeat;
+            if (delta > 0 && delta <= 2 * ttlMs) {
+                long elapsedSeconds = Math.round(delta / 1000.0);
+                if (prevModpackId != null) {
+                    addPlaytime(uuid, prevModpackId, elapsedSeconds);
+                }
+                List<UUID> onlineFriends = onlineFriendsOf(uuid);
+                if (!onlineFriends.isEmpty()) {
+                    addSocialTime(uuid, elapsedSeconds);
+                    for (UUID friend : onlineFriends) {
+                        recordSocialPair(uuid, friend, now);
+                    }
+                }
+            }
+        }
+        if (modpackId != null && !modpackId.isBlank() && !modpackId.equals(prevModpackId)) {
+            setLastModpack(uuid, modpackId);
+        }
+        if (skin != null && !skin.equals(p.persistedSkin)) {
+            p.persistedSkin = skin;
+            saveSkinRef(uuid, Json.write(skin), now);
+        }
+        if (!p.hosting) {
+            p.hostingAnnounced = false;
+            return false;
+        }
+        if (joinCode != null && !p.hostingAnnounced) {
+            p.hostingAnnounced = true;
+            return true;
+        }
+        return false;
+    }
+
+    String connectivity(UUID uuid) {
+        Presence p = presences.get(uuid);
+        if (p == null) {
+            return "UNKNOWN";
+        }
+        long age = System.currentTimeMillis() - p.lastHeartbeat;
+        if (age <= ttlMs) {
+            return "ONLINE";
+        }
+        if (age <= 2 * ttlMs) {
+            return "STALE";
+        }
+        return "OFFLINE";
+    }
+
+    String hostingJoinCode(UUID uuid) {
+        Presence p = presences.get(uuid);
+        String c = connectivity(uuid);
+        if (p != null && p.hosting && ("ONLINE".equals(c) || "STALE".equals(c))) {
+            return p.joinCode;
+        }
+        return null;
+    }
+
+    boolean joinCodeVisibleTo(UUID host, UUID viewer) {
+        Presence p = presences.get(host);
+        if (p == null || !"INVITED".equals(p.accessMode)) {
+            return true;
+        }
+        return viewer != null && p.allowedUuids.contains(viewer);
+    }
+
+    private static boolean isLive(String connectivity) {
+        return "ONLINE".equals(connectivity) || "STALE".equals(connectivity);
+    }
+
+    private boolean isOnline(UUID uuid) {
+        return "ONLINE".equals(connectivity(uuid));
+    }
+
+    String getMeta() {
+        try (Reader r = read()) {
+            try (PreparedStatement ps = conn().prepareStatement("SELECT value FROM meta WHERE key=?")) {
+                ps.setString(1, "latest_version");
+                try (ResultSet rs = ps.executeQuery()) {
+                    return rs.next() ? rs.getString(1) : null;
+                }
+            } catch (SQLException e) {
+                throw fail("getMeta", e);
+            }
+        }
+    }
+
+    void setMeta(String value) {
+        synchronized (lock) {
+            try (PreparedStatement ps = conn().prepareStatement(
+                    "INSERT INTO meta (key, value) VALUES (?,?) "
+                            + "ON CONFLICT(key) DO UPDATE SET value=excluded.value")) {
+                ps.setString(1, "latest_version");
+                ps.setString(2, value);
+                ps.executeUpdate();
+            } catch (SQLException e) {
+                throw fail("setMeta", e);
+            }
+        }
+    }
+
+    private void saveSkinRef(UUID uuid, String skinJson, long now) {
+        synchronized (lock) {
+            try (PreparedStatement ps = conn().prepareStatement(
+                    "INSERT INTO user_skin (uuid, skin_json, updated_at) VALUES (?,?,?) "
+                            + "ON CONFLICT(uuid) DO UPDATE SET skin_json=excluded.skin_json, "
+                            + "updated_at=excluded.updated_at")) {
+                ps.setString(1, uuid.toString());
+                ps.setString(2, skinJson);
+                ps.setLong(3, now);
+                ps.executeUpdate();
+            } catch (SQLException e) {
+                throw fail("saveSkinRef", e);
+            }
+        }
+    }
+
+    private Object persistedSkinLocked(UUID uuid) throws SQLException {
+        try (PreparedStatement ps = conn().prepareStatement(
+                "SELECT skin_json FROM user_skin WHERE uuid=?")) {
+            ps.setString(1, uuid.toString());
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? Json.parse(rs.getString(1)) : null;
+            }
+        }
+    }
+
+    // hosted skins
+    void putHostedSkin(UUID uuid, byte[] png, String hash, String model) {
+        synchronized (lock) {
+            try (PreparedStatement ps = conn().prepareStatement(
+                    "INSERT INTO skin_data (uuid, png, hash, model, updated_at) VALUES (?,?,?,?,?) "
+                            + "ON CONFLICT(uuid) DO UPDATE SET png=excluded.png, hash=excluded.hash, "
+                            + "model=excluded.model, updated_at=excluded.updated_at")) {
+                ps.setString(1, uuid.toString());
+                ps.setBytes(2, png);
+                ps.setString(3, hash);
+                ps.setString(4, model);
+                ps.setLong(5, System.currentTimeMillis());
+                ps.executeUpdate();
+            } catch (SQLException e) {
+                throw fail("putHostedSkin", e);
+            }
+        }
+    }
+
+    void deleteHostedSkin(UUID uuid) {
+        synchronized (lock) {
+            try (PreparedStatement ps = conn().prepareStatement(
+                    "DELETE FROM skin_data WHERE uuid=?")) {
+                ps.setString(1, uuid.toString());
+                ps.executeUpdate();
+            } catch (SQLException e) {
+                throw fail("deleteHostedSkin", e);
+            }
+        }
+    }
+
+    byte[] hostedSkinPng(UUID uuid) {
+        try (Reader r = read()) {
+            try (PreparedStatement ps = conn().prepareStatement(
+                    "SELECT png FROM skin_data WHERE uuid=?")) {
+                ps.setString(1, uuid.toString());
+                try (ResultSet rs = ps.executeQuery()) {
+                    return rs.next() ? rs.getBytes(1) : null;
+                }
+            } catch (SQLException e) {
+                throw fail("hostedSkinPng", e);
+            }
+        }
+    }
+
+    Object[] activeSkin(UUID uuid) {
+        try (Reader r = read()) {
+            try (PreparedStatement ps = conn().prepareStatement(
+                    "SELECT png, hash, model FROM skin_data WHERE uuid=?")) {
+                ps.setString(1, uuid.toString());
+                try (ResultSet rs = ps.executeQuery()) {
+                    return rs.next() ? new Object[]{rs.getBytes(1), rs.getString(2), rs.getString(3)} : null;
+                }
+            } catch (SQLException e) {
+                throw fail("activeSkin", e);
+            }
+        }
+    }
+
+    String activeSkinHash(UUID uuid) {
+        try (Reader r = read()) {
+            try (PreparedStatement ps = conn().prepareStatement(
+                    "SELECT hash FROM skin_data WHERE uuid=?")) {
+                ps.setString(1, uuid.toString());
+                try (ResultSet rs = ps.executeQuery()) {
+                    return rs.next() ? rs.getString(1) : null;
+                }
+            } catch (SQLException e) {
+                throw fail("activeSkinHash", e);
+            }
+        }
+    }
+
+    void addLibrarySkin(UUID uuid, String skinId, byte[] png, String model) {
+        synchronized (lock) {
+            try (PreparedStatement ps = conn().prepareStatement(
+                    "INSERT INTO skin_library (uuid, skin_id, png, model, created_at) VALUES (?,?,?,?,?) "
+                            + "ON CONFLICT(uuid, skin_id) DO UPDATE SET created_at=excluded.created_at")) {
+                ps.setString(1, uuid.toString());
+                ps.setString(2, skinId);
+                ps.setBytes(3, png);
+                ps.setString(4, model);
+                ps.setLong(5, System.currentTimeMillis());
+                ps.executeUpdate();
+            } catch (SQLException e) {
+                throw fail("addLibrarySkin", e);
+            }
+        }
+    }
+
+    void deleteLibrarySkin(UUID uuid, String skinId) {
+        synchronized (lock) {
+            try (PreparedStatement ps = conn().prepareStatement(
+                    "DELETE FROM skin_library WHERE uuid=? AND skin_id=?")) {
+                ps.setString(1, uuid.toString());
+                ps.setString(2, skinId);
+                ps.executeUpdate();
+            } catch (SQLException e) {
+                throw fail("deleteLibrarySkin", e);
+            }
+        }
+    }
+
+    List<Map<String, Object>> listLibrarySkins(UUID uuid) {
+        try (Reader r = read()) {
+            List<Map<String, Object>> out = new ArrayList<>();
+            try (PreparedStatement ps = conn().prepareStatement(
+                    "SELECT skin_id, model FROM skin_library WHERE uuid=? ORDER BY created_at DESC")) {
+                ps.setString(1, uuid.toString());
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        Map<String, Object> m = new LinkedHashMap<>();
+                        m.put("skinId", rs.getString(1));
+                        m.put("model", rs.getString(2));
+                        out.add(m);
+                    }
+                }
+                return out;
+            } catch (SQLException e) {
+                throw fail("listLibrarySkins", e);
+            }
+        }
+    }
+
+    int countLibrarySkins(UUID uuid) {
+        try (Reader r = read()) {
+            try (PreparedStatement ps = conn().prepareStatement(
+                    "SELECT COUNT(*) FROM skin_library WHERE uuid=?")) {
+                ps.setString(1, uuid.toString());
+                try (ResultSet rs = ps.executeQuery()) {
+                    return rs.next() ? rs.getInt(1) : 0;
+                }
+            } catch (SQLException e) {
+                throw fail("countLibrarySkins", e);
+            }
+        }
+    }
+
+    byte[] librarySkinPng(UUID uuid, String skinId) {
+        try (Reader r = read()) {
+            try (PreparedStatement ps = conn().prepareStatement(
+                    "SELECT png FROM skin_library WHERE uuid=? AND skin_id=?")) {
+                ps.setString(1, uuid.toString());
+                ps.setString(2, skinId);
+                try (ResultSet rs = ps.executeQuery()) {
+                    return rs.next() ? rs.getBytes(1) : null;
+                }
+            } catch (SQLException e) {
+                throw fail("librarySkinPng", e);
+            }
+        }
+    }
+
+    String librarySkinModel(UUID uuid, String skinId) {
+        try (Reader r = read()) {
+            try (PreparedStatement ps = conn().prepareStatement(
+                    "SELECT model FROM skin_library WHERE uuid=? AND skin_id=?")) {
+                ps.setString(1, uuid.toString());
+                ps.setString(2, skinId);
+                try (ResultSet rs = ps.executeQuery()) {
+                    return rs.next() ? rs.getString(1) : null;
+                }
+            } catch (SQLException e) {
+                throw fail("librarySkinModel", e);
+            }
+        }
+    }
+
+    private void markOnline(UUID uuid) {
+        synchronized (lock) {
+            try (PreparedStatement ps = conn().prepareStatement(
+                    "INSERT INTO presence_state (uuid, online) VALUES (?,1) "
+                            + "ON CONFLICT(uuid) DO UPDATE SET online=1")) {
+                ps.setString(1, uuid.toString());
+                ps.executeUpdate();
+            } catch (SQLException e) {
+                throw fail("markOnline", e);
+            }
+        }
+    }
+
+    private void markOffline(UUID uuid, long at) {
+        synchronized (lock) {
+            try (PreparedStatement ps = conn().prepareStatement(
+                    "INSERT INTO presence_state (uuid, online, last_disconnect_at) VALUES (?,0,?) "
+                            + "ON CONFLICT(uuid) DO UPDATE SET online=0, last_disconnect_at=excluded.last_disconnect_at")) {
+                ps.setString(1, uuid.toString());
+                ps.setLong(2, at);
+                ps.executeUpdate();
+            } catch (SQLException e) {
+                throw fail("markOffline", e);
+            }
+        }
+    }
+
+    // profile privacy
+    boolean isInvisible(UUID uuid) {
+        try (Reader r = read()) {
+            return invisibleLocked(uuid);
+        }
+    }
+
+    void setInvisible(UUID uuid, boolean invisible) {
+        synchronized (lock) {
+            try (PreparedStatement ps = conn().prepareStatement(
+                    "INSERT INTO profile_privacy (uuid, invisible_mode) VALUES (?,?) "
+                            + "ON CONFLICT(uuid) DO UPDATE SET invisible_mode=excluded.invisible_mode")) {
+                ps.setString(1, uuid.toString());
+                ps.setInt(2, invisible ? 1 : 0);
+                ps.executeUpdate();
+            } catch (SQLException e) {
+                throw fail("setInvisible", e);
+            }
+        }
+    }
+
+    private boolean invisibleLocked(UUID uuid) {
+        try (PreparedStatement ps = conn().prepareStatement(
+                "SELECT invisible_mode FROM profile_privacy WHERE uuid=?")) {
+            ps.setString(1, uuid.toString());
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() && rs.getInt(1) != 0;
+            }
+        } catch (SQLException e) {
+            throw fail("isInvisible", e);
+        }
+    }
+
+    void setDiscoverable(UUID uuid, boolean discoverable) {
+        synchronized (lock) {
+            try (PreparedStatement ps = conn().prepareStatement(
+                    "INSERT INTO profile_privacy (uuid, discoverable) VALUES (?,?) "
+                            + "ON CONFLICT(uuid) DO UPDATE SET discoverable=excluded.discoverable")) {
+                ps.setString(1, uuid.toString());
+                ps.setInt(2, discoverable ? 1 : 0);
+                ps.executeUpdate();
+            } catch (SQLException e) {
+                throw fail("setDiscoverable", e);
+            }
+        }
+    }
+
+    private boolean discoverableLocked(UUID uuid) {
+        try (PreparedStatement ps = conn().prepareStatement(
+                "SELECT discoverable FROM profile_privacy WHERE uuid=?")) {
+            ps.setString(1, uuid.toString());
+            try (ResultSet rs = ps.executeQuery()) {
+                return !rs.next() || rs.getInt(1) != 0;
+            }
+        } catch (SQLException e) {
+            throw fail("isDiscoverable", e);
+        }
+    }
+
+    void setProfilePublic(UUID uuid, boolean isPublic) {
+        synchronized (lock) {
+            try (PreparedStatement ps = conn().prepareStatement(
+                    "INSERT INTO profile_privacy (uuid, profile_public) VALUES (?,?) "
+                            + "ON CONFLICT(uuid) DO UPDATE SET profile_public=excluded.profile_public")) {
+                ps.setString(1, uuid.toString());
+                ps.setInt(2, isPublic ? 1 : 0);
+                ps.executeUpdate();
+            } catch (SQLException e) {
+                throw fail("setProfilePublic", e);
+            }
+        }
+    }
+
+    private boolean profilePublicLocked(UUID uuid) {
+        try (PreparedStatement ps = conn().prepareStatement(
+                "SELECT profile_public FROM profile_privacy WHERE uuid=?")) {
+            ps.setString(1, uuid.toString());
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() && rs.getInt(1) != 0;
+            }
+        } catch (SQLException e) {
+            throw fail("profilePublic", e);
+        }
+    }
+
+    Map<String, Object> publicProfile(String friendCode) {
+        if (friendCode == null || friendCode.isBlank()) {
+            return null;
+        }
+        UUID uuid;
+        try (Reader r = read()) {
+            try (PreparedStatement ps = conn().prepareStatement(
+                    "SELECT uuid FROM users WHERE friend_code=?")) {
+                ps.setString(1, friendCode);
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (!rs.next()) {
+                        return null;
+                    }
+                    uuid = UUID.fromString(rs.getString(1));
+                }
+            } catch (SQLException e) {
+                throw fail("publicProfile", e);
+            }
+            if (!profilePublicLocked(uuid) || invisibleLocked(uuid)) {
+                return null;
+            }
+        }
+        Map<String, Object> p = profile(uuid, null);
+        if (p == null) {
+            return null;
+        }
+        p.remove("uuid");
+        p.remove("online");
+        p.remove("lastSeen");
+        return p;
+    }
+
+    List<Object> publicWorlds() {
+        List<Object> worlds = new ArrayList<>();
+        try (Reader r = read();
+             PreparedStatement user = conn().prepareStatement(
+                     "SELECT username, banned FROM users WHERE uuid=?")) {
+            for (Map.Entry<UUID, Presence> entry : presences.entrySet()) {
+                UUID uuid = entry.getKey();
+                Presence presence = entry.getValue();
+                if (!presence.hosting || !isLive(connectivity(uuid))
+                        || !"EVERYONE".equals(presence.accessMode)
+                        || presence.worldName == null || presence.worldName.isBlank()
+                        || invisibleLocked(uuid)) {
+                    continue;
+                }
+
+                user.setString(1, uuid.toString());
+                try (ResultSet rs = user.executeQuery()) {
+                    if (!rs.next() || rs.getInt("banned") != 0) {
+                        continue;
+                    }
+                    worlds.add(ordered(
+                            "name", presence.worldName,
+                            "owner", rs.getString("username"),
+                            "modpackId", presence.modpackId,
+                            "gameMode", presence.gameMode,
+                            "difficulty", presence.difficulty));
+                }
+            }
+        } catch (SQLException e) {
+            throw fail("publicWorlds", e);
+        }
+        return worlds;
+    }
+
+    private Long lastDisconnectLocked(UUID uuid) {
+        try (PreparedStatement ps = conn().prepareStatement(
+                "SELECT last_disconnect_at FROM presence_state WHERE uuid=?")) {
+            ps.setString(1, uuid.toString());
+            try (ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) {
+                    long v = rs.getLong(1);
+                    return rs.wasNull() ? null : v;
+                }
+                return null;
+            }
+        } catch (SQLException e) {
+            throw fail("lastDisconnectAt", e);
+        }
+    }
+
+    // friends
+    AddResult addFriendRequest(UUID uuid, UUID friendUuid) {
+        if (uuid.equals(friendUuid)) {
+            return AddResult.BLOCKED;
+        }
+        ensureUser(uuid, null);
+        ensureUser(friendUuid, null);
+        synchronized (lock) {
+            try {
+                if (areFriends(uuid, friendUuid)) {
+                    return AddResult.ACCEPTED;
+                }
+                if (isBlockedLocked(friendUuid, uuid)) {
+                    return AddResult.BLOCKED;
+                }
+                if (requestExists(friendUuid, uuid)) {
+                    acceptRequestLocked(uuid, friendUuid);
+                    return AddResult.ACCEPTED;
+                }
+                try (PreparedStatement ps = conn().prepareStatement(
+                        "INSERT OR IGNORE INTO friend_requests (from_uuid, to_uuid) VALUES (?,?)")) {
+                    ps.setString(1, uuid.toString());
+                    ps.setString(2, friendUuid.toString());
+                    ps.executeUpdate();
+                }
+                return AddResult.REQUESTED;
+            } catch (SQLException e) {
+                throw fail("addFriendRequest", e);
+            }
+        }
+    }
+
+    boolean acceptRequest(UUID uuid, UUID friendUuid) {
+        synchronized (lock) {
+            try {
+                return acceptRequestLocked(uuid, friendUuid);
+            } catch (SQLException e) {
+                throw fail("acceptRequest", e);
+            }
+        }
+    }
+
+    void declineRequest(UUID uuid, UUID friendUuid) {
+        synchronized (lock) {
+            try {
+                clearRequestLocked(uuid, friendUuid);
+            } catch (SQLException e) {
+                throw fail("declineRequest", e);
+            }
+        }
+    }
+
+    void removeFriend(UUID uuid, UUID friendUuid) {
+        String[] pair = normalize(uuid, friendUuid);
+        synchronized (lock) {
+            try (PreparedStatement ps = conn().prepareStatement(
+                    "DELETE FROM friends WHERE a=? AND b=?")) {
+                ps.setString(1, pair[0]);
+                ps.setString(2, pair[1]);
+                ps.executeUpdate();
+            } catch (SQLException e) {
+                throw fail("removeFriend", e);
+            }
+        }
+    }
+
+    List<Object> friendRequests(UUID uuid) {
+        List<Object> out = new ArrayList<>();
+        try (Reader r = read()) {
+            try (PreparedStatement ps = conn().prepareStatement(
+                    "SELECT r.from_uuid, u.username FROM friend_requests r "
+                            + "JOIN users u ON u.uuid = r.from_uuid WHERE r.to_uuid = ?")) {
+                ps.setString(1, uuid.toString());
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        UUID rid = UUID.fromString(rs.getString(1));
+                        out.add(ordered("uuid", rs.getString(1), "username", rs.getString(2),
+                                "online", isOnline(rid)));
+                    }
+                }
+            } catch (SQLException e) {
+                throw fail("friendRequests", e);
+            }
+        }
+        return out;
+    }
+
+    Set<UUID> friendsOf(UUID uuid) {
+        Set<UUID> out = new LinkedHashSet<>();
+        String s = uuid.toString();
+        try (Reader r = read()) {
+            try (PreparedStatement ps = conn().prepareStatement(
+                    "SELECT b FROM friends WHERE a=? UNION SELECT a FROM friends WHERE b=?")) {
+                ps.setString(1, s);
+                ps.setString(2, s);
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        out.add(UUID.fromString(rs.getString(1)));
+                    }
+                }
+            } catch (SQLException e) {
+                throw fail("friendsOf", e);
+            }
+        }
+        return out;
+    }
+
+    List<Object> friendSuggestions(UUID u) {
+        String s = u.toString();
+        Map<UUID, String> myFriends = new LinkedHashMap<>();
+        Map<UUID, Integer> counts = new LinkedHashMap<>();
+        Map<UUID, List<String>> mutualNames = new HashMap<>();
+        List<Object> out = new ArrayList<>();
+        try (Reader r = read()) {
+            try {
+                try (PreparedStatement ps = conn().prepareStatement(
+                        "SELECT u.uuid, u.username FROM friends f "
+                                + "JOIN users u ON u.uuid = (CASE WHEN f.a=? THEN f.b ELSE f.a END) "
+                                + "WHERE f.a=? OR f.b=?")) {
+                    ps.setString(1, s);
+                    ps.setString(2, s);
+                    ps.setString(3, s);
+                    try (ResultSet rs = ps.executeQuery()) {
+                        while (rs.next()) {
+                            myFriends.put(UUID.fromString(rs.getString(1)), rs.getString(2));
+                        }
+                    }
+                }
+                if (myFriends.isEmpty()) {
+                    return out;
+                }
+                String ph = String.join(",", java.util.Collections.nCopies(myFriends.size(), "?"));
+                try (PreparedStatement ps = conn().prepareStatement(
+                        "SELECT a, b FROM friends WHERE a IN (" + ph + ") OR b IN (" + ph + ")")) {
+                    int i = 1;
+                    for (UUID w : myFriends.keySet()) {
+                        ps.setString(i, w.toString());
+                        ps.setString(i + myFriends.size(), w.toString());
+                        i++;
+                    }
+                    try (ResultSet rs = ps.executeQuery()) {
+                        while (rs.next()) {
+                            UUID a = UUID.fromString(rs.getString(1));
+                            UUID b = UUID.fromString(rs.getString(2));
+                            UUID w;
+                            UUID v;
+                            if (myFriends.containsKey(a) && !myFriends.containsKey(b)) {
+                                w = a;
+                                v = b;
+                            } else if (myFriends.containsKey(b) && !myFriends.containsKey(a)) {
+                                w = b;
+                                v = a;
+                            } else {
+                                continue;
+                            }
+                            if (v.equals(u)) {
+                                continue;
+                            }
+                            counts.merge(v, 1, Integer::sum);
+                            List<String> ns = mutualNames.computeIfAbsent(v, k -> new ArrayList<>());
+                            if (ns.size() < MUTUAL_NAMES_SHOWN) {
+                                ns.add(myFriends.get(w));
+                            }
+                        }
+                    }
+                }
+                if (counts.isEmpty()) {
+                    return out;
+                }
+                Set<UUID> excluded = new HashSet<>();
+                try (PreparedStatement ps = conn().prepareStatement(
+                        "SELECT from_uuid, to_uuid FROM friend_requests WHERE from_uuid=? OR to_uuid=?")) {
+                    ps.setString(1, s);
+                    ps.setString(2, s);
+                    try (ResultSet rs = ps.executeQuery()) {
+                        while (rs.next()) {
+                            excluded.add(UUID.fromString(rs.getString(1)));
+                            excluded.add(UUID.fromString(rs.getString(2)));
+                        }
+                    }
+                }
+                try (PreparedStatement ps = conn().prepareStatement(
+                        "SELECT uuid, target FROM relationships WHERE blocked=1 AND (uuid=? OR target=?)")) {
+                    ps.setString(1, s);
+                    ps.setString(2, s);
+                    try (ResultSet rs = ps.executeQuery()) {
+                        while (rs.next()) {
+                            excluded.add(UUID.fromString(rs.getString(1)));
+                            excluded.add(UUID.fromString(rs.getString(2)));
+                        }
+                    }
+                }
+                try (PreparedStatement ps = conn().prepareStatement(
+                        "SELECT uuid FROM profile_privacy WHERE discoverable=0")) {
+                    try (ResultSet rs = ps.executeQuery()) {
+                        while (rs.next()) {
+                            excluded.add(UUID.fromString(rs.getString(1)));
+                        }
+                    }
+                }
+                counts.keySet().removeAll(excluded);
+                if (counts.isEmpty()) {
+                    return out;
+                }
+                List<UUID> ids = new ArrayList<>(counts.keySet());
+                Map<UUID, String> candidateNames = new HashMap<>();
+                Map<UUID, String> candidateCodes = new HashMap<>();
+                String idPh = String.join(",", java.util.Collections.nCopies(ids.size(), "?"));
+                try (PreparedStatement ps = conn().prepareStatement(
+                        "SELECT uuid, username, friend_code FROM users WHERE uuid IN (" + idPh + ")")) {
+                    for (int i = 0; i < ids.size(); i++) {
+                        ps.setString(i + 1, ids.get(i).toString());
+                    }
+                    try (ResultSet rs = ps.executeQuery()) {
+                        while (rs.next()) {
+                            candidateNames.put(UUID.fromString(rs.getString(1)), rs.getString(2));
+                            candidateCodes.put(UUID.fromString(rs.getString(1)), rs.getString(3));
+                        }
+                    }
+                }
+                ids.sort((x, y) -> Integer.compare(counts.get(y), counts.get(x)));
+                for (UUID v : ids) {
+                    String name = candidateNames.get(v);
+                    if (name == null) {
+                        continue;
+                    }
+                    out.add(ordered("uuid", v.toString(), "username", name,
+                            "friendCode", candidateCodes.get(v),
+                            "mutualCount", counts.get(v),
+                            "mutualNames", mutualNames.getOrDefault(v, List.of())));
+                    if (out.size() >= SUGGESTIONS_LIMIT) {
+                        break;
+                    }
+                }
+            } catch (SQLException e) {
+                throw fail("friendSuggestions", e);
+            }
+        }
+        return out;
+    }
+
+    void setCosmetic(UUID uuid, String slot, String cosmeticId) {
+        synchronized (lock) {
+            try (PreparedStatement ps = conn().prepareStatement(
+                    "INSERT INTO cosmetic_loadout (uuid, slot, cosmetic_id, equipped_at) VALUES (?,?,?,?) "
+                            + "ON CONFLICT(uuid, slot) DO UPDATE SET cosmetic_id=excluded.cosmetic_id, "
+                            + "equipped_at=excluded.equipped_at")) {
+                ps.setString(1, uuid.toString());
+                ps.setString(2, slot);
+                ps.setString(3, cosmeticId);
+                ps.setLong(4, System.currentTimeMillis());
+                ps.executeUpdate();
+            } catch (SQLException e) {
+                throw fail("setCosmetic", e);
+            }
+        }
+    }
+
+    void clearCosmetic(UUID uuid, String slot) {
+        synchronized (lock) {
+            try (PreparedStatement ps = conn().prepareStatement(
+                    "DELETE FROM cosmetic_loadout WHERE uuid=? AND slot=?")) {
+                ps.setString(1, uuid.toString());
+                ps.setString(2, slot);
+                ps.executeUpdate();
+            } catch (SQLException e) {
+                throw fail("clearCosmetic", e);
+            }
+        }
+    }
+
+    Map<String, Object> cosmeticLoadout(UUID uuid) {
+        Map<String, Object> out = new LinkedHashMap<>();
+        try (Reader r = read()) {
+            try (PreparedStatement ps = conn().prepareStatement(
+                    "SELECT slot, cosmetic_id FROM cosmetic_loadout WHERE uuid=?")) {
+                ps.setString(1, uuid.toString());
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        out.put(rs.getString(1), rs.getString(2));
+                    }
+                }
+            } catch (SQLException e) {
+                throw fail("cosmeticLoadout", e);
+            }
+        }
+        return out;
+    }
+
+    Map<String, Object> cosmeticShop(UUID uuid) {
+        Map<String, Object> out = new LinkedHashMap<>();
+        List<Object> owned = new ArrayList<>();
+        try (Reader r = read()) {
+            try {
+                out.put("balance", Math.max(0, totalXpLocked(uuid) - spentLocked(uuid)));
+                try (PreparedStatement ps = conn().prepareStatement(
+                        "SELECT cosmetic_id FROM cosmetic_ownership WHERE uuid=?")) {
+                    ps.setString(1, uuid.toString());
+                    try (ResultSet rs = ps.executeQuery()) {
+                        while (rs.next()) {
+                            owned.add(rs.getString(1));
+                        }
+                    }
+                }
+            } catch (SQLException e) {
+                throw fail("cosmeticShop", e);
+            }
+        }
+        out.put("owned", owned);
+        return out;
+    }
+
+    long purchaseCosmetic(UUID uuid, String cosmeticId, int price) {
+        synchronized (lock) {
+            try {
+                long balance = totalXpLocked(uuid) - spentLocked(uuid);
+                if (ownsCosmeticLocked(uuid, cosmeticId)) {
+                    return Math.max(0, balance);
+                }
+                if (balance < price) {
+                    return -1;
+                }
+                try (PreparedStatement ps = conn().prepareStatement(
+                        "INSERT INTO cosmetic_ownership (uuid, cosmetic_id, cost, purchased_at) VALUES (?,?,?,?)")) {
+                    ps.setString(1, uuid.toString());
+                    ps.setString(2, cosmeticId);
+                    ps.setInt(3, Math.max(0, price));
+                    ps.setLong(4, System.currentTimeMillis());
+                    ps.executeUpdate();
+                }
+                return balance - price;
+            } catch (SQLException e) {
+                throw fail("purchaseCosmetic", e);
+            }
+        }
+    }
+
+    private long spentLocked(UUID uuid) throws SQLException {
+        try (PreparedStatement ps = conn().prepareStatement(
+                "SELECT COALESCE(SUM(cost), 0) FROM cosmetic_ownership WHERE uuid=?")) {
+            ps.setString(1, uuid.toString());
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? rs.getLong(1) : 0;
+            }
+        }
+    }
+
+    private boolean ownsCosmeticLocked(UUID uuid, String cosmeticId) throws SQLException {
+        try (PreparedStatement ps = conn().prepareStatement(
+                "SELECT 1 FROM cosmetic_ownership WHERE uuid=? AND cosmetic_id=?")) {
+            ps.setString(1, uuid.toString());
+            ps.setString(2, cosmeticId);
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next();
+            }
+        }
+    }
+
+    List<Object> friendList(UUID uuid) {
+        Map<UUID, String> names = new LinkedHashMap<>();
+        Map<UUID, int[]> rel = new HashMap<>();
+        Map<UUID, Integer> tiers = new HashMap<>();
+        Map<UUID, Object> persistedSkins = new HashMap<>();
+        Set<UUID> invisible = new HashSet<>();
+        String s = uuid.toString();
+        try (Reader r = read()) {
+            try {
+                try (PreparedStatement ps = conn().prepareStatement(
+                        "SELECT u.uuid, u.username FROM friends f "
+                                + "JOIN users u ON u.uuid = (CASE WHEN f.a=? THEN f.b ELSE f.a END) "
+                                + "WHERE f.a=? OR f.b=?")) {
+                    ps.setString(1, s);
+                    ps.setString(2, s);
+                    ps.setString(3, s);
+                    try (ResultSet rs = ps.executeQuery()) {
+                        while (rs.next()) {
+                            names.put(UUID.fromString(rs.getString(1)), rs.getString(2));
+                        }
+                    }
+                }
+                for (UUID fid : names.keySet()) {
+                    tiers.put(fid, tierFor(totalXpLocked(fid)));
+                }
+                try (PreparedStatement ps = conn().prepareStatement(
+                        "SELECT target, muted, blocked FROM relationships WHERE uuid=?")) {
+                    ps.setString(1, s);
+                    try (ResultSet rs = ps.executeQuery()) {
+                        while (rs.next()) {
+                            rel.put(UUID.fromString(rs.getString(1)), new int[]{rs.getInt(2), rs.getInt(3)});
+                        }
+                    }
+                }
+                try (PreparedStatement ps = conn().prepareStatement(
+                        "SELECT uuid FROM profile_privacy WHERE invisible_mode != 0")) {
+                    try (ResultSet rs = ps.executeQuery()) {
+                        while (rs.next()) {
+                            invisible.add(UUID.fromString(rs.getString(1)));
+                        }
+                    }
+                }
+                List<UUID> needPersisted = new ArrayList<>();
+                for (UUID fid : names.keySet()) {
+                    Presence p = presences.get(fid);
+                    if (p == null || p.skin == null) {
+                        needPersisted.add(fid);
+                    }
+                }
+                if (!needPersisted.isEmpty()) {
+                    String placeholders = String.join(",", java.util.Collections.nCopies(needPersisted.size(), "?"));
+                    try (PreparedStatement ps = conn().prepareStatement(
+                            "SELECT uuid, skin_json FROM user_skin WHERE uuid IN (" + placeholders + ")")) {
+                        for (int i = 0; i < needPersisted.size(); i++) {
+                            ps.setString(i + 1, needPersisted.get(i).toString());
+                        }
+                        try (ResultSet rs = ps.executeQuery()) {
+                            while (rs.next()) {
+                                Object persisted = Json.parse(rs.getString(2));
+                                if (persisted != null) {
+                                    persistedSkins.put(UUID.fromString(rs.getString(1)), persisted);
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (SQLException e) {
+                throw fail("friendList", e);
+            }
+        }
+        List<Object> out = new ArrayList<>();
+        for (Map.Entry<UUID, String> e : names.entrySet()) {
+            UUID fid = e.getKey();
+            int[] r = rel.get(fid);
+            boolean muted = r != null && r[0] == 1;
+            boolean blocked = r != null && r[1] == 1;
+            boolean suppress = muted || blocked;
+            boolean hidden = invisible.contains(fid);
+            String conn = suppress ? "UNKNOWN" : (hidden ? "OFFLINE" : connectivity(fid));
+            boolean live = !hidden && ("ONLINE".equals(conn) || "STALE".equals(conn));
+            Presence p = presences.get(fid);
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("uuid", fid.toString());
+            m.put("username", e.getValue());
+            m.put("connectivity", conn);
+            m.put("state", live && p != null ? p.state : null);
+            m.put("worldName", live && p != null ? p.worldName : null);
+            m.put("joinCode", (suppress || hidden || !joinCodeVisibleTo(fid, uuid)) ? null : hostingJoinCode(fid));
+            m.put("skin", p != null && p.skin != null ? p.skin : persistedSkins.get(fid));
+            m.put("muted", muted);
+            m.put("blocked", blocked);
+            m.put("tier", tiers.getOrDefault(fid, 0));
+            m.put("gameMode", live && p != null ? p.gameMode : null);
+            m.put("difficulty", live && p != null ? p.difficulty : null);
+            m.put("allowCommands", live && p != null && p.allowCommands);
+            out.add(m);
+        }
+        return out;
+    }
+
+    private boolean acceptRequestLocked(UUID uuid, UUID friendUuid) throws SQLException {
+        boolean prevAuto = connection.getAutoCommit();
+        connection.setAutoCommit(false);
+        try {
+            clearRequestLocked(uuid, friendUuid);
+            linkFriendsLocked(uuid, friendUuid);
+            long now = System.currentTimeMillis();
+            User a = findUser(uuid);
+            User b = findUser(friendUuid);
+            recordActivityLocked(uuid, "FRIEND_ADDED", b == null ? null : b.username, now);
+            recordActivityLocked(friendUuid, "FRIEND_ADDED", a == null ? null : a.username, now);
+            connection.commit();
+            return true;
+        } catch (SQLException e) {
+            connection.rollback();
+            throw e;
+        } finally {
+            connection.setAutoCommit(prevAuto);
+        }
+    }
+
+    private void clearRequestLocked(UUID a, UUID b) throws SQLException {
+        try (PreparedStatement ps = conn().prepareStatement(
+                "DELETE FROM friend_requests WHERE (from_uuid=? AND to_uuid=?) "
+                        + "OR (from_uuid=? AND to_uuid=?)")) {
+            ps.setString(1, a.toString());
+            ps.setString(2, b.toString());
+            ps.setString(3, b.toString());
+            ps.setString(4, a.toString());
+            ps.executeUpdate();
+        }
+    }
+
+    private void linkFriendsLocked(UUID a, UUID b) throws SQLException {
+        String[] pair = normalize(a, b);
+        try (PreparedStatement ps = conn().prepareStatement(
+                "INSERT OR IGNORE INTO friends (a, b) VALUES (?,?)")) {
+            ps.setString(1, pair[0]);
+            ps.setString(2, pair[1]);
+            ps.executeUpdate();
+        }
+    }
+
+    private boolean areFriends(UUID a, UUID b) throws SQLException {
+        String[] pair = normalize(a, b);
+        try (PreparedStatement ps = conn().prepareStatement(
+                "SELECT 1 FROM friends WHERE a=? AND b=?")) {
+            ps.setString(1, pair[0]);
+            ps.setString(2, pair[1]);
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next();
+            }
+        }
+    }
+
+    private boolean requestExists(UUID from, UUID to) throws SQLException {
+        try (PreparedStatement ps = conn().prepareStatement(
+                "SELECT 1 FROM friend_requests WHERE from_uuid=? AND to_uuid=?")) {
+            ps.setString(1, from.toString());
+            ps.setString(2, to.toString());
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next();
+            }
+        }
+    }
+
+    void setMuted(UUID uuid, UUID target, boolean muted) {
+        setRelationFlag(uuid, target, "muted", muted);
+    }
+
+    void setBlocked(UUID uuid, UUID target, boolean blocked) {
+        setRelationFlag(uuid, target, "blocked", blocked);
+    }
+
+    boolean isMutedOrBlocked(UUID uuid, UUID target) {
+        try (Reader r = read()) {
+            try (PreparedStatement ps = conn().prepareStatement(
+                    "SELECT 1 FROM relationships WHERE uuid=? AND target=? AND (muted=1 OR blocked=1)")) {
+                ps.setString(1, uuid.toString());
+                ps.setString(2, target.toString());
+                try (ResultSet rs = ps.executeQuery()) {
+                    return rs.next();
+                }
+            } catch (SQLException e) {
+                throw fail("isMutedOrBlocked", e);
+            }
+        }
+    }
+
+    boolean isBlocked(UUID uuid, UUID target) {
+        try (Reader r = read()) {
+            try {
+                return isBlockedLocked(uuid, target);
+            } catch (SQLException e) {
+                throw fail("isBlocked", e);
+            }
+        }
+    }
+
+    private boolean isBlockedLocked(UUID uuid, UUID target) throws SQLException {
+        try (PreparedStatement ps = conn().prepareStatement(
+                "SELECT 1 FROM relationships WHERE uuid=? AND target=? AND blocked=1")) {
+            ps.setString(1, uuid.toString());
+            ps.setString(2, target.toString());
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next();
+            }
+        }
+    }
+
+    private void setRelationFlag(UUID uuid, UUID target, String col, boolean value) {
+        if (uuid.equals(target)) {
+            return;
+        }
+        synchronized (lock) {
+            try {
+                try (PreparedStatement ps = conn().prepareStatement(
+                        "INSERT OR IGNORE INTO relationships (uuid, target, muted, blocked) VALUES (?,?,0,0)")) {
+                    ps.setString(1, uuid.toString());
+                    ps.setString(2, target.toString());
+                    ps.executeUpdate();
+                }
+                try (PreparedStatement ps = conn().prepareStatement(
+                        "UPDATE relationships SET " + col + "=? WHERE uuid=? AND target=?")) {
+                    ps.setInt(1, value ? 1 : 0);
+                    ps.setString(2, uuid.toString());
+                    ps.setString(3, target.toString());
+                    ps.executeUpdate();
+                }
+                try (PreparedStatement ps = conn().prepareStatement(
+                        "DELETE FROM relationships WHERE uuid=? AND target=? AND muted=0 AND blocked=0")) {
+                    ps.setString(1, uuid.toString());
+                    ps.setString(2, target.toString());
+                    ps.executeUpdate();
+                }
+            } catch (SQLException e) {
+                throw fail("setRelationFlag", e);
+            }
+        }
+    }
+
+    private static final String[] LINK_PLATFORMS =
+            {"discord", "instagram", "twitter", "youtube", "twitch", "tiktok", "paypal", "kofi"};
+
+    private static final Set<String> VISIBILITY_COLUMNS = Set.of(
+            "favorite_modpack_visible", "currently_playing_visible", "recently_played_visible");
+
+    private static final Set<String> BACKGROUND_STYLES = Set.of("DARK", "SOLID", "MINECRAFT", "IMAGE");
+    static final String DEFAULT_BG_STYLE = "DARK";
+    static final int DEFAULT_BG_COLOR = 0x0A0C10;
+    static final int DEFAULT_BG_OPACITY = 92;
+
+    boolean isBackgroundStyle(String style) {
+        return style != null && BACKGROUND_STYLES.contains(style);
+    }
+
+    boolean isLinkPlatform(String platform) {
+        for (String p : LINK_PLATFORMS) {
+            if (p.equals(platform)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    static final int MAX_PROMPTS = 3;
+    private static final String[] PROMPT_IDS =
+            {"delete_block", "first_night", "build_first", "useless_item",
+                    "difficulty", "travel", "armor", "playstyle"};
+
+    boolean isPromptId(String id) {
+        for (String p : PROMPT_IDS) {
+            if (p.equals(id)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // progression
+    private static final long[] TIER_THRESHOLDS = {150, 450, 1000, 2000};
+    private static final int XP_PER_ADVANCEMENT = 2;
+    private static final long XP_WINDOW_MS = 5 * 60 * 1000L;
+    private static final int XP_WINDOW_MAX = 10;
+    private static final long SECONDS_PER_PLAYTIME_XP = 200;
+    private static final long SECONDS_PER_SOCIAL_XP = 100;
+    private static final long ACTIVITY_RETENTION_MS = 14L * 24 * 60 * 60 * 1000;
+    private static final long SOCIAL_SESSION_GAP_MS = 10L * 60 * 1000;
+
+    static int tierFor(long xp) {
+        int tier = 0;
+        for (long threshold : TIER_THRESHOLDS) {
+            if (xp >= threshold) {
+                tier++;
+            }
+        }
+        return tier;
+    }
+
+    boolean recordAdvancement(UUID uuid, String advancementId) {
+        synchronized (lock) {
+            try {
+                long now = System.currentTimeMillis();
+                int changed;
+                try (PreparedStatement ps = conn().prepareStatement(
+                        "INSERT OR IGNORE INTO advancements (uuid, advancement_id, earned_at) VALUES (?,?,?)")) {
+                    ps.setString(1, uuid.toString());
+                    ps.setString(2, advancementId);
+                    ps.setLong(3, now);
+                    changed = ps.executeUpdate();
+                }
+                if (changed == 0) {
+                    return false;
+                }
+                long windowStart = now - (now % XP_WINDOW_MS);
+                int count;
+                try (PreparedStatement ps = conn().prepareStatement(
+                        "SELECT count FROM advancement_xp_window WHERE uuid=? AND window_start=?")) {
+                    ps.setString(1, uuid.toString());
+                    ps.setLong(2, windowStart);
+                    try (ResultSet rs = ps.executeQuery()) {
+                        count = rs.next() ? rs.getInt(1) : 0;
+                    }
+                }
+                if (count >= XP_WINDOW_MAX) {
+                    return false;
+                }
+                try (PreparedStatement ps = conn().prepareStatement(
+                        "INSERT INTO advancement_xp_window (uuid, window_start, count) VALUES (?,?,1) "
+                                + "ON CONFLICT(uuid, window_start) DO UPDATE SET count=count+1")) {
+                    ps.setString(1, uuid.toString());
+                    ps.setLong(2, windowStart);
+                    ps.executeUpdate();
+                }
+                addXpTotalLocked(uuid, "advancement", XP_PER_ADVANCEMENT, now);
+                try (PreparedStatement ps = conn().prepareStatement(
+                        "INSERT INTO xp_events (uuid, source, amount, detail, created_at) VALUES (?,?,?,?,?)")) {
+                    ps.setString(1, uuid.toString());
+                    ps.setString(2, "advancement");
+                    ps.setInt(3, XP_PER_ADVANCEMENT);
+                    ps.setString(4, advancementId);
+                    ps.setLong(5, now);
+                    ps.executeUpdate();
+                }
+                return true;
+            } catch (SQLException e) {
+                throw fail("recordAdvancement", e);
+            }
+        }
+    }
+
+    private void creditCumulativeXpLocked(UUID uuid, String source, long totalUnits, long unitsPerXp, long now)
+            throws SQLException {
+        long target = totalUnits / unitsPerXp;
+        if (target <= 0) {
+            return;
+        }
+        long awarded = getXpTotalLocked(uuid, source);
+        long delta = target - awarded;
+        if (delta <= 0) {
+            return;
+        }
+        addXpTotalLocked(uuid, source, delta, now);
+        try (PreparedStatement ps = conn().prepareStatement(
+                "INSERT INTO xp_events (uuid, source, amount, detail, created_at) VALUES (?,?,?,?,?)")) {
+            ps.setString(1, uuid.toString());
+            ps.setString(2, source);
+            ps.setLong(3, delta);
+            ps.setString(4, null);
+            ps.setLong(5, now);
+            ps.executeUpdate();
+        }
+    }
+
+    private long totalXpLocked(UUID uuid) throws SQLException {
+        try (PreparedStatement ps = conn().prepareStatement(
+                "SELECT COALESCE(SUM(total), 0) FROM xp_totals WHERE uuid=?")) {
+            ps.setString(1, uuid.toString());
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? rs.getLong(1) : 0;
+            }
+        }
+    }
+
+    private long getXpTotalLocked(UUID uuid, String source) throws SQLException {
+        try (PreparedStatement ps = conn().prepareStatement(
+                "SELECT total FROM xp_totals WHERE uuid=? AND source=?")) {
+            ps.setString(1, uuid.toString());
+            ps.setString(2, source);
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? rs.getLong(1) : 0;
+            }
+        }
+    }
+
+    private void addXpTotalLocked(UUID uuid, String source, long amount, long now) throws SQLException {
+        try (PreparedStatement ps = conn().prepareStatement(
+                "INSERT INTO xp_totals (uuid, source, total, updated_at) VALUES (?,?,?,?) "
+                        + "ON CONFLICT(uuid, source) DO UPDATE SET total=total+excluded.total, updated_at=excluded.updated_at")) {
+            ps.setString(1, uuid.toString());
+            ps.setString(2, source);
+            ps.setLong(3, amount);
+            ps.setLong(4, now);
+            ps.executeUpdate();
+        }
+    }
+
+    private static void migrateXpTotalsLocked(Statement st) throws SQLException {
+        try {
+            st.executeUpdate(
+                    "INSERT INTO xp_totals (uuid, source, total, updated_at) "
+                            + "SELECT uuid, source, SUM(amount), MAX(created_at) FROM xp_events GROUP BY uuid, source "
+                            + "ON CONFLICT(uuid, source) DO UPDATE SET total=excluded.total, updated_at=excluded.updated_at");
+        } catch (SQLException e) {
+            BackendServer.log("SQLite error (migrateXpTotals): " + e.getMessage());
+        }
+    }
+
+    private int advancementCountLocked(UUID uuid) throws SQLException {
+        try (PreparedStatement ps = conn().prepareStatement(
+                "SELECT COUNT(*) FROM advancements WHERE uuid=?")) {
+            ps.setString(1, uuid.toString());
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? rs.getInt(1) : 0;
+            }
+        }
+    }
+
+    private Map<String, Object> xpBySourceLocked(UUID uuid) throws SQLException {
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("advancement", 0);
+        m.put("playtime", 0);
+        m.put("social", 0);
+        try (PreparedStatement ps = conn().prepareStatement(
+                "SELECT source, total FROM xp_totals WHERE uuid=?")) {
+            ps.setString(1, uuid.toString());
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    m.put(rs.getString(1), rs.getInt(2));
+                }
+            }
+        }
+        return m;
+    }
+
+    Map<String, Object> profile(UUID uuid, UUID viewer) {
+        try (Reader r = read()) {
+            try {
+                User u = findUser(uuid);
+                if (u == null || isBanned(uuid)) {
+                    return null;
+                }
+                Map<String, Object> m = new LinkedHashMap<>();
+                m.put("uuid", uuid.toString());
+                m.put("username", u.username);
+                m.put("friendCode", u.friendCode);
+                Presence skinPres = presences.get(uuid);
+                m.put("skin", skinPres != null && skinPres.skin != null
+                        ? skinPres.skin : persistedSkinLocked(uuid));
+                m.put("pronouns", scalar("SELECT pronouns FROM profile_identity WHERE uuid=?", uuid));
+                m.put("bio", scalar("SELECT text FROM profile_bio WHERE uuid=?", uuid));
+                Map<String, Object> links = new LinkedHashMap<>();
+                try (PreparedStatement ps = conn().prepareStatement(
+                        "SELECT discord, instagram, twitter, youtube, twitch, tiktok, paypal, kofi "
+                                + "FROM profile_links WHERE uuid=?")) {
+                    ps.setString(1, uuid.toString());
+                    try (ResultSet rs = ps.executeQuery()) {
+                        if (rs.next()) {
+                            for (int i = 0; i < LINK_PLATFORMS.length; i++) {
+                                links.put(LINK_PLATFORMS[i], rs.getString(i + 1));
+                            }
+                        }
+                    }
+                }
+                m.put("links", links);
+
+                Map<String, Object> prompts = new LinkedHashMap<>();
+                try (PreparedStatement ps = conn().prepareStatement(
+                        "SELECT prompt_id, answer FROM profile_prompts WHERE uuid=?")) {
+                    ps.setString(1, uuid.toString());
+                    try (ResultSet rs = ps.executeQuery()) {
+                        while (rs.next()) {
+                            prompts.put(rs.getString(1), rs.getString(2));
+                        }
+                    }
+                }
+                m.put("prompts", prompts);
+
+                // presence: live online state is derived in-memory; last seen is the persisted transition.
+                boolean self = viewer != null && viewer.equals(uuid);
+                boolean invisible = invisibleLocked(uuid);
+                boolean live = isLive(connectivity(uuid));
+                m.put("online", live && (self || !invisible));
+                m.put("lastSeen", lastDisconnectLocked(uuid));
+                if (self) {
+                    m.put("invisible", invisible);
+                    m.put("discoverable", discoverableLocked(uuid));
+                    m.put("profilePublic", profilePublicLocked(uuid));
+                }
+
+                String favoriteId = null;
+                boolean favoriteVisible = true;
+                boolean currentlyPlayingVisible = true;
+                boolean recentlyPlayedVisible = true;
+                String bgStyle = DEFAULT_BG_STYLE;
+                int bgColor = DEFAULT_BG_COLOR;
+                int bgOpacity = DEFAULT_BG_OPACITY;
+                String bgImageId = null;
+                String bannerId = null;
+                try (PreparedStatement ps = conn().prepareStatement(
+                        "SELECT favorite_modpack_id, favorite_modpack_visible, currently_playing_visible, "
+                                + "recently_played_visible, bg_style, bg_color, bg_opacity, "
+                                + "bg_image_id, banner_id "
+                                + "FROM profile_settings WHERE uuid=?")) {
+                    ps.setString(1, uuid.toString());
+                    try (ResultSet rs = ps.executeQuery()) {
+                        if (rs.next()) {
+                            favoriteId = rs.getString(1);
+                            favoriteVisible = rs.getInt(2) != 0;
+                            currentlyPlayingVisible = rs.getInt(3) != 0;
+                            recentlyPlayedVisible = rs.getInt(4) != 0;
+                            String style = rs.getString(5);
+                            if (isBackgroundStyle(style)) {
+                                bgStyle = style;
+                            }
+                            int color = rs.getInt(6);
+                            if (!rs.wasNull()) {
+                                bgColor = color & 0xFFFFFF;
+                            }
+                            int opacity = rs.getInt(7);
+                            if (!rs.wasNull()) {
+                                bgOpacity = Math.max(0, Math.min(100, opacity));
+                            }
+                            bgImageId = rs.getString(8);
+                            bannerId = rs.getString(9);
+                        }
+                    }
+                }
+
+                Presence pres = presences.get(uuid);
+                String mp = pres == null ? null : pres.modpackId;
+                boolean showPlaying = live && (self || (!invisible && currentlyPlayingVisible));
+                m.put("currentlyPlaying", showPlaying ? resolveModpackLocked(mp) : null);
+                boolean showLastPlayed = self || (!invisible && recentlyPlayedVisible);
+                m.put("lastPlayed", showLastPlayed ? resolveModpackLocked(lastModpackLocked(uuid)) : null);
+                m.put("favorite", (self || favoriteVisible) ? resolveModpackLocked(favoriteId) : null);
+                m.put("recentlyPlayed", (self || recentlyPlayedVisible) ? recentlyPlayedLocked(uuid) : null);
+                String bgImageHash = bgImageId == null || backgrounds == null ? null : backgrounds.hash(bgImageId);
+                if (bgImageHash == null) {
+                    bgImageId = null;
+                    if ("IMAGE".equals(bgStyle)) {
+                        bgStyle = DEFAULT_BG_STYLE;
+                    }
+                }
+                Map<String, Object> background = new LinkedHashMap<>();
+                background.put("style", bgStyle);
+                background.put("color", bgColor);
+                background.put("opacity", bgOpacity);
+                background.put("imageId", bgImageId);
+                background.put("image", bgImageId == null ? null : backgrounds.url(bgImageId));
+                background.put("imageHash", bgImageHash);
+                m.put("background", background);
+
+                String bannerHash = bannerId == null || banners == null ? null : banners.hash(bannerId);
+                if (bannerHash == null) {
+                    m.put("banner", null);
+                } else {
+                    Map<String, Object> banner = new LinkedHashMap<>();
+                    banner.put("id", bannerId);
+                    banner.put("url", banners.url(bannerId));
+                    banner.put("hash", bannerHash);
+                    m.put("banner", banner);
+                }
+
+                if (self) {
+                    Map<String, Object> settings = new LinkedHashMap<>();
+                    settings.put("favoriteVisible", favoriteVisible);
+                    settings.put("currentlyPlayingVisible", currentlyPlayingVisible);
+                    settings.put("recentlyPlayedVisible", recentlyPlayedVisible);
+                    m.put("settings", settings);
+                }
+
+                long xp = totalXpLocked(uuid);
+                Map<String, Object> progression = new LinkedHashMap<>();
+                progression.put("tier", tierFor(xp));
+                progression.put("advancements", advancementCountLocked(uuid));
+                if (self) {
+                    progression.put("xp", xp);
+                    progression.put("sources", xpBySourceLocked(uuid));
+                }
+                m.put("progression", progression);
+
+                if (!self && viewer != null && areFriends(viewer, uuid)) {
+                    m.put("playedTogether", playedTogetherLocked(viewer, uuid));
+                }
+                return m;
+            } catch (SQLException e) {
+                throw fail("profile", e);
+            }
+        }
+    }
+
+    String registeredModpackOrNull(String modpackId) {
+        if (modpackId == null || modpackId.isBlank()) {
+            return null;
+        }
+        try (Reader r = read()) {
+            try (PreparedStatement ps = conn().prepareStatement(
+                    "SELECT 1 FROM modpack_registry WHERE modpack_id=?")) {
+                ps.setString(1, modpackId);
+                try (ResultSet rs = ps.executeQuery()) {
+                    return rs.next() ? modpackId : null;
+                }
+            } catch (SQLException e) {
+                throw fail("registeredModpackOrNull", e);
+            }
+        }
+    }
+
+    private Map<String, Object> resolveModpackLocked(String modpackId) throws SQLException {
+        if (modpackId == null || modpackId.isBlank()) {
+            return null;
+        }
+        try (PreparedStatement ps = conn().prepareStatement(
+                "SELECT name, download_url FROM modpack_registry WHERE modpack_id=?")) {
+            ps.setString(1, modpackId);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (!rs.next()) {
+                    return null;
+                }
+                Map<String, Object> m = new LinkedHashMap<>();
+                m.put("modpackId", modpackId);
+                m.put("name", rs.getString(1));
+                m.put("downloadUrl", rs.getString(2));
+                return m;
+            }
+        }
+    }
+
+    void addPlaytime(UUID uuid, String modpackId, long seconds) {
+        if (modpackId == null || modpackId.isBlank() || seconds <= 0) {
+            return;
+        }
+        synchronized (lock) {
+            try {
+                long now = System.currentTimeMillis();
+                try (PreparedStatement ps = conn().prepareStatement(
+                        "INSERT INTO playtime (uuid, modpack_id, seconds, updated_at) "
+                                + "SELECT ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM modpack_registry WHERE modpack_id=?) "
+                                + "ON CONFLICT(uuid, modpack_id) DO UPDATE SET "
+                                + "seconds=seconds+excluded.seconds, updated_at=excluded.updated_at")) {
+                    ps.setString(1, uuid.toString());
+                    ps.setString(2, modpackId);
+                    ps.setLong(3, seconds);
+                    ps.setLong(4, now);
+                    ps.setString(5, modpackId);
+                    ps.executeUpdate();
+                }
+                long totalPlay = scalarLongLocked(
+                        "SELECT COALESCE(SUM(seconds), 0) FROM playtime WHERE uuid=?", uuid);
+                creditCumulativeXpLocked(uuid, "playtime", totalPlay, SECONDS_PER_PLAYTIME_XP, now);
+            } catch (SQLException e) {
+                throw fail("addPlaytime", e);
+            }
+        }
+    }
+
+    void setLastModpack(UUID uuid, String modpackId) {
+        if (modpackId == null || modpackId.isBlank()) {
+            return;
+        }
+        String value = modpackId.length() > 100 ? modpackId.substring(0, 100) : modpackId;
+        synchronized (lock) {
+            try (PreparedStatement ps = conn().prepareStatement(
+                    "UPDATE users SET last_modpack=? WHERE uuid=?")) {
+                ps.setString(1, value);
+                ps.setString(2, uuid.toString());
+                ps.executeUpdate();
+            } catch (SQLException e) {
+                throw fail("setLastModpack", e);
+            }
+        }
+    }
+
+    void addSocialTime(UUID uuid, long seconds) {
+        if (seconds <= 0) {
+            return;
+        }
+        synchronized (lock) {
+            try {
+                long now = System.currentTimeMillis();
+                try (PreparedStatement ps = conn().prepareStatement(
+                        "INSERT INTO social_time (uuid, seconds, updated_at) VALUES (?,?,?) "
+                                + "ON CONFLICT(uuid) DO UPDATE SET "
+                                + "seconds=seconds+excluded.seconds, updated_at=excluded.updated_at")) {
+                    ps.setString(1, uuid.toString());
+                    ps.setLong(2, seconds);
+                    ps.setLong(3, now);
+                    ps.executeUpdate();
+                }
+                long totalSocial = scalarLongLocked(
+                        "SELECT COALESCE(seconds, 0) FROM social_time WHERE uuid=?", uuid);
+                creditCumulativeXpLocked(uuid, "social", totalSocial, SECONDS_PER_SOCIAL_XP, now);
+            } catch (SQLException e) {
+                throw fail("addSocialTime", e);
+            }
+        }
+    }
+
+    private String lastModpackLocked(UUID uuid) throws SQLException {
+        try (PreparedStatement ps = conn().prepareStatement(
+                "SELECT last_modpack FROM users WHERE uuid=?")) {
+            ps.setString(1, uuid.toString());
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? rs.getString(1) : null;
+            }
+        }
+    }
+
+    private long scalarLongLocked(String sql, UUID uuid) throws SQLException {
+        try (PreparedStatement ps = conn().prepareStatement(sql)) {
+            ps.setString(1, uuid.toString());
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? rs.getLong(1) : 0;
+            }
+        }
+    }
+
+    private List<UUID> onlineFriendsOf(UUID uuid) {
+        List<UUID> out = new ArrayList<>();
+        for (UUID fid : friendsOf(uuid)) {
+            if (isLive(connectivity(fid))) {
+                out.add(fid);
+            }
+        }
+        return out;
+    }
+
+    void recordSocialPair(UUID a, UUID b, long now) {
+        String[] pair = normalize(a, b);
+        synchronized (lock) {
+            try {
+                long lastAt = 0;
+                try (PreparedStatement ps = conn().prepareStatement(
+                        "SELECT last_at FROM social_pair WHERE a=? AND b=?")) {
+                    ps.setString(1, pair[0]);
+                    ps.setString(2, pair[1]);
+                    try (ResultSet rs = ps.executeQuery()) {
+                        if (rs.next()) {
+                            lastAt = rs.getLong(1);
+                        }
+                    }
+                }
+                boolean newSession = now - lastAt > SOCIAL_SESSION_GAP_MS;
+                try (PreparedStatement ps = conn().prepareStatement(
+                        "INSERT INTO social_pair (a, b, sessions, last_at) VALUES (?,?,1,?) "
+                                + "ON CONFLICT(a, b) DO UPDATE SET "
+                                + "sessions = sessions + ?, last_at = excluded.last_at")) {
+                    ps.setString(1, pair[0]);
+                    ps.setString(2, pair[1]);
+                    ps.setLong(3, now);
+                    ps.setInt(4, newSession ? 1 : 0);
+                    ps.executeUpdate();
+                }
+            } catch (SQLException e) {
+                throw fail("recordSocialPair", e);
+            }
+        }
+    }
+
+    void recordHostingStarted(UUID actor, String worldName) {
+        synchronized (lock) {
+            try {
+                recordActivityLocked(actor, "HOSTING_STARTED", truncate(worldName, 120),
+                        System.currentTimeMillis());
+            } catch (SQLException e) {
+                throw fail("recordHostingStarted", e);
+            }
+        }
+    }
+
+    private void recordActivityLocked(UUID actor, String type, String subject, long now)
+            throws SQLException {
+        try (PreparedStatement ps = conn().prepareStatement(
+                "INSERT INTO activity (actor_uuid, type, subject, created_at) VALUES (?,?,?,?)")) {
+            ps.setString(1, actor.toString());
+            ps.setString(2, type);
+            ps.setString(3, subject);
+            ps.setLong(4, now);
+            ps.executeUpdate();
+        }
+        try (PreparedStatement ps = conn().prepareStatement(
+                "DELETE FROM activity WHERE created_at < ?")) {
+            ps.setLong(1, now - ACTIVITY_RETENTION_MS);
+            ps.executeUpdate();
+        }
+    }
+
+    List<Object> activityFeed(UUID viewer) {
+        Set<UUID> friends = friendsOf(viewer);
+        if (friends.isEmpty()) {
+            return List.of();
+        }
+        long cutoff = System.currentTimeMillis() - ACTIVITY_RETENTION_MS;
+        try (Reader r = read()) {
+            try {
+                StringBuilder in = new StringBuilder();
+                for (int i = 0; i < friends.size(); i++) {
+                    in.append(i == 0 ? "?" : ",?");
+                }
+                String sql = "SELECT a.actor_uuid, u.username, a.type, a.subject, a.created_at "
+                        + "FROM activity a JOIN users u ON u.uuid = a.actor_uuid "
+                        + "WHERE a.created_at >= ? AND a.actor_uuid IN (" + in + ") "
+                        + "ORDER BY a.created_at DESC LIMIT 100";
+                List<Object> out = new ArrayList<>();
+                try (PreparedStatement ps = conn().prepareStatement(sql)) {
+                    ps.setLong(1, cutoff);
+                    int idx = 2;
+                    for (UUID f : friends) {
+                        ps.setString(idx++, f.toString());
+                    }
+                    try (ResultSet rs = ps.executeQuery()) {
+                        while (rs.next() && out.size() < 20) {
+                            UUID actor = UUID.fromString(rs.getString(1));
+                            if (isMutedOrBlocked(viewer, actor) || invisibleLocked(actor)) {
+                                continue;
+                            }
+                            out.add(ordered("actor", rs.getString(1), "actorName", rs.getString(2),
+                                    "type", rs.getString(3), "subject", rs.getString(4),
+                                    "at", rs.getLong(5)));
+                        }
+                    }
+                }
+                return out;
+            } catch (SQLException e) {
+                throw fail("activityFeed", e);
+            }
+        }
+    }
+
+    List<Object> announcementsUnseen(UUID viewer) {
+        try (Reader r = read()) {
+            try (PreparedStatement ps = conn().prepareStatement(
+                    "SELECT id, type, title, body, created_at, image_id FROM announcements "
+                            + "WHERE active = 1 AND id NOT IN "
+                            + "(SELECT announcement_id FROM announcement_seen WHERE user_uuid = ?) "
+                            + "ORDER BY created_at ASC")) {
+                ps.setString(1, viewer.toString());
+                return announcementRows(ps);
+            } catch (SQLException e) {
+                throw fail("announcementsUnseen", e);
+            }
+        }
+    }
+
+    List<Object> announcementsAll() {
+        try (Reader r = read()) {
+            try (PreparedStatement ps = conn().prepareStatement(
+                    "SELECT id, type, title, body, created_at, image_id FROM announcements "
+                            + "WHERE active = 1 ORDER BY created_at DESC")) {
+                return announcementRows(ps);
+            } catch (SQLException e) {
+                throw fail("announcementsAll", e);
+            }
+        }
+    }
+
+    void deactivateAnnouncement(int id) {
+        synchronized (lock) {
+            try (PreparedStatement ps = conn().prepareStatement(
+                    "UPDATE announcements SET active = 0 WHERE id = ?")) {
+                ps.setInt(1, id);
+                ps.executeUpdate();
+            } catch (SQLException e) {
+                throw fail("deactivateAnnouncement", e);
+            }
+        }
+    }
+
+    private List<Object> announcementRows(PreparedStatement ps) throws SQLException {
+        List<Object> out = new ArrayList<>();
+        try (ResultSet rs = ps.executeQuery()) {
+            while (rs.next()) {
+                String imageId = rs.getString(6);
+                out.add(ordered("id", rs.getInt(1), "type", rs.getString(2),
+                        "title", rs.getString(3), "body", rs.getString(4),
+                        "createdAt", rs.getLong(5),
+                        "imageId", imageId,
+                        "image", imageId == null || announcementImages == null ? null : announcementImages.url(imageId),
+                        "imageHash", imageId == null || announcementImages == null ? null : announcementImages.hash(imageId)));
+            }
+        }
+        return out;
+    }
+
+    void markAnnouncementsSeen(UUID viewer, List<Integer> ids) {
+        if (ids == null || ids.isEmpty()) {
+            return;
+        }
+        synchronized (lock) {
+            try (PreparedStatement ps = conn().prepareStatement(
+                    "INSERT OR IGNORE INTO announcement_seen (user_uuid, announcement_id) VALUES (?,?)")) {
+                for (Integer id : ids) {
+                    if (id == null) {
+                        continue;
+                    }
+                    ps.setString(1, viewer.toString());
+                    ps.setInt(2, id);
+                    ps.executeUpdate();
+                }
+            } catch (SQLException e) {
+                throw fail("markAnnouncementsSeen", e);
+            }
+        }
+    }
+
+    Map<String, Object> publishAnnouncement(String type, String title, String body, String imageId) {
+        long now = System.currentTimeMillis();
+        synchronized (lock) {
+            try (PreparedStatement ps = conn().prepareStatement(
+                    "INSERT INTO announcements (type, title, body, created_at, active, image_id) VALUES (?,?,?,?,1,?)",
+                    Statement.RETURN_GENERATED_KEYS)) {
+                ps.setString(1, type);
+                ps.setString(2, title);
+                ps.setString(3, body);
+                ps.setLong(4, now);
+                ps.setString(5, imageId);
+                ps.executeUpdate();
+                int id;
+                try (ResultSet rs = ps.getGeneratedKeys()) {
+                    id = rs.next() ? rs.getInt(1) : 0;
+                }
+                return ordered("id", id, "type", type, "title", title, "body", body, "createdAt", now,
+                        "imageId", imageId,
+                        "image", imageId == null || announcementImages == null ? null : announcementImages.url(imageId),
+                        "imageHash", imageId == null || announcementImages == null ? null : announcementImages.hash(imageId));
+            } catch (SQLException e) {
+                throw fail("publishAnnouncement", e);
+            }
+        }
+    }
+
+    private void markAllAnnouncementsSeenLocked(String uuid) throws SQLException {
+        try (PreparedStatement ps = conn().prepareStatement(
+                "INSERT OR IGNORE INTO announcement_seen (user_uuid, announcement_id) "
+                        + "SELECT ?, id FROM announcements WHERE active = 1")) {
+            ps.setString(1, uuid);
+            ps.executeUpdate();
+        }
+    }
+
+    private Map<String, Object> playedTogetherLocked(UUID a, UUID b) throws SQLException {
+        String[] pair = normalize(a, b);
+        try (PreparedStatement ps = conn().prepareStatement(
+                "SELECT sessions, last_at FROM social_pair WHERE a=? AND b=?")) {
+            ps.setString(1, pair[0]);
+            ps.setString(2, pair[1]);
+            try (ResultSet rs = ps.executeQuery()) {
+                Map<String, Object> m = new LinkedHashMap<>();
+                if (rs.next()) {
+                    m.put("sessions", rs.getLong(1));
+                    long lastAt = rs.getLong(2);
+                    m.put("lastAt", rs.wasNull() ? null : lastAt);
+                } else {
+                    m.put("sessions", 0L);
+                    m.put("lastAt", null);
+                }
+                return m;
+            }
+        }
+    }
+
+    private static String truncate(String s, int max) {
+        if (s == null) {
+            return null;
+        }
+        return s.length() > max ? s.substring(0, max) : s;
+    }
+
+    private Map<String, Object> recentlyPlayedLocked(UUID uuid) throws SQLException {
+        try (PreparedStatement ps = conn().prepareStatement(
+                "SELECT r.modpack_id, r.name, r.download_url FROM playtime p "
+                        + "JOIN modpack_registry r ON r.modpack_id = p.modpack_id "
+                        + "WHERE p.uuid=? ORDER BY p.updated_at DESC LIMIT 1")) {
+            ps.setString(1, uuid.toString());
+            try (ResultSet rs = ps.executeQuery()) {
+                if (!rs.next()) {
+                    return null;
+                }
+                Map<String, Object> m = new LinkedHashMap<>();
+                m.put("modpackId", rs.getString(1));
+                m.put("name", rs.getString(2));
+                m.put("downloadUrl", rs.getString(3));
+                return m;
+            }
+        }
+    }
+
+    List<Map<String, Object>> listModpacks() {
+        try (Reader r = read()) {
+            List<Map<String, Object>> out = new ArrayList<>();
+            try (PreparedStatement ps = conn().prepareStatement(
+                    "SELECT modpack_id, name, download_url FROM modpack_registry ORDER BY name");
+                 ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    Map<String, Object> m = new LinkedHashMap<>();
+                    m.put("modpackId", rs.getString(1));
+                    m.put("name", rs.getString(2));
+                    m.put("downloadUrl", rs.getString(3));
+                    out.add(m);
+                }
+                return out;
+            } catch (SQLException e) {
+                throw fail("listModpacks", e);
+            }
+        }
+    }
+
+    boolean currentlyPlayingVisible(UUID uuid) {
+        try (Reader r = read()) {
+            try (PreparedStatement ps = conn().prepareStatement(
+                    "SELECT currently_playing_visible FROM profile_settings WHERE uuid=?")) {
+                ps.setString(1, uuid.toString());
+                try (ResultSet rs = ps.executeQuery()) {
+                    return !rs.next() || rs.getInt(1) != 0;
+                }
+            } catch (SQLException e) {
+                throw fail("currentlyPlayingVisible", e);
+            }
+        }
+    }
+
+    void setFavoriteModpack(UUID uuid, String modpackId) {
+        String value = (modpackId == null || modpackId.isBlank()) ? null : modpackId;
+        synchronized (lock) {
+            try {
+                ensureSettingsRowLocked(uuid);
+                try (PreparedStatement ps = conn().prepareStatement(
+                        "UPDATE profile_settings SET favorite_modpack_id=?, updated_at=? WHERE uuid=?")) {
+                    ps.setString(1, value);
+                    ps.setLong(2, System.currentTimeMillis());
+                    ps.setString(3, uuid.toString());
+                    ps.executeUpdate();
+                }
+            } catch (SQLException e) {
+                throw fail("setFavoriteModpack", e);
+            }
+        }
+    }
+
+    void setModpackVisibility(UUID uuid, String column, boolean visible) {
+        if (!VISIBILITY_COLUMNS.contains(column)) {
+            return;
+        }
+        synchronized (lock) {
+            try {
+                ensureSettingsRowLocked(uuid);
+                try (PreparedStatement ps = conn().prepareStatement(
+                        "UPDATE profile_settings SET " + column + "=?, updated_at=? WHERE uuid=?")) {
+                    ps.setInt(1, visible ? 1 : 0);
+                    ps.setLong(2, System.currentTimeMillis());
+                    ps.setString(3, uuid.toString());
+                    ps.executeUpdate();
+                }
+            } catch (SQLException e) {
+                throw fail("setModpackVisibility", e);
+            }
+        }
+    }
+
+    void setBackground(UUID uuid, String style, int color, int opacity) {
+        String s = isBackgroundStyle(style) ? style : DEFAULT_BG_STYLE;
+        int c = color & 0xFFFFFF;
+        int o = Math.max(0, Math.min(100, opacity));
+        synchronized (lock) {
+            try {
+                ensureSettingsRowLocked(uuid);
+                try (PreparedStatement ps = conn().prepareStatement(
+                        "UPDATE profile_settings SET bg_style=?, bg_color=?, bg_opacity=?, updated_at=? "
+                                + "WHERE uuid=?")) {
+                    ps.setString(1, s);
+                    ps.setInt(2, c);
+                    ps.setInt(3, o);
+                    ps.setLong(4, System.currentTimeMillis());
+                    ps.setString(5, uuid.toString());
+                    ps.executeUpdate();
+                }
+            } catch (SQLException e) {
+                throw fail("setBackground", e);
+            }
+        }
+    }
+
+    void setBackgroundImage(UUID uuid, String imageId) {
+        setSettingsText(uuid, "bg_image_id", imageId, "setBackgroundImage");
+    }
+
+    void setBanner(UUID uuid, String bannerId) {
+        setSettingsText(uuid, "banner_id", bannerId, "setBanner");
+    }
+
+    private void setSettingsText(UUID uuid, String column, String value, String op) {
+        String v = value == null || value.isBlank() ? null : value;
+        synchronized (lock) {
+            try {
+                ensureSettingsRowLocked(uuid);
+                try (PreparedStatement ps = conn().prepareStatement(
+                        "UPDATE profile_settings SET " + column + "=?, updated_at=? WHERE uuid=?")) {
+                    ps.setString(1, v);
+                    ps.setLong(2, System.currentTimeMillis());
+                    ps.setString(3, uuid.toString());
+                    ps.executeUpdate();
+                }
+            } catch (SQLException e) {
+                throw fail(op, e);
+            }
+        }
+    }
+
+    String backgroundImageId(UUID uuid) {
+        synchronized (lock) {
+            try (PreparedStatement ps = conn().prepareStatement(
+                    "SELECT bg_image_id FROM profile_settings WHERE uuid=?")) {
+                ps.setString(1, uuid.toString());
+                try (ResultSet rs = ps.executeQuery()) {
+                    return rs.next() ? rs.getString(1) : null;
+                }
+            } catch (SQLException e) {
+                throw fail("backgroundImageId", e);
+            }
+        }
+    }
+
+    private void ensureSettingsRowLocked(UUID uuid) throws SQLException {
+        try (PreparedStatement ps = conn().prepareStatement(
+                "INSERT OR IGNORE INTO profile_settings (uuid, updated_at) VALUES (?,?)")) {
+            ps.setString(1, uuid.toString());
+            ps.setLong(2, System.currentTimeMillis());
+            ps.executeUpdate();
+        }
+    }
+
+    void setBio(UUID uuid, String text) {
+        synchronized (lock) {
+            try (PreparedStatement ps = conn().prepareStatement(
+                    "INSERT INTO profile_bio (uuid, text, updated_at) VALUES (?,?,?) "
+                            + "ON CONFLICT(uuid) DO UPDATE SET text=excluded.text, updated_at=excluded.updated_at")) {
+                ps.setString(1, uuid.toString());
+                ps.setString(2, text == null ? "" : text);
+                ps.setLong(3, System.currentTimeMillis());
+                ps.executeUpdate();
+            } catch (SQLException e) {
+                throw fail("setBio", e);
+            }
+        }
+    }
+
+    void setPronouns(UUID uuid, String pronouns) {
+        synchronized (lock) {
+            try (PreparedStatement ps = conn().prepareStatement(
+                    "INSERT INTO profile_identity (uuid, pronouns) VALUES (?,?) "
+                            + "ON CONFLICT(uuid) DO UPDATE SET pronouns=excluded.pronouns")) {
+                ps.setString(1, uuid.toString());
+                ps.setString(2, pronouns);
+                ps.executeUpdate();
+            } catch (SQLException e) {
+                throw fail("setPronouns", e);
+            }
+        }
+    }
+
+    void setLink(UUID uuid, String platform, String value) {
+        if (!isLinkPlatform(platform)) {
+            return;
+        }
+        synchronized (lock) {
+            try {
+                try (PreparedStatement ps = conn().prepareStatement(
+                        "INSERT OR IGNORE INTO profile_links (uuid) VALUES (?)")) {
+                    ps.setString(1, uuid.toString());
+                    ps.executeUpdate();
+                }
+                try (PreparedStatement ps = conn().prepareStatement(
+                        "UPDATE profile_links SET " + platform + "=? WHERE uuid=?")) {
+                    ps.setString(1, (value == null || value.isBlank()) ? null : value);
+                    ps.setString(2, uuid.toString());
+                    ps.executeUpdate();
+                }
+            } catch (SQLException e) {
+                throw fail("setLink", e);
+            }
+        }
+    }
+
+    // Replace the player's whole set of prompt answers (not a patch). Blank/null answers are dropped.
+    void setPrompts(UUID uuid, Map<String, String> answers) {
+        synchronized (lock) {
+            try (PreparedStatement del = conn().prepareStatement(
+                    "DELETE FROM profile_prompts WHERE uuid=?")) {
+                del.setString(1, uuid.toString());
+                del.executeUpdate();
+                long now = System.currentTimeMillis();
+                try (PreparedStatement ins = conn().prepareStatement(
+                        "INSERT INTO profile_prompts (uuid, prompt_id, answer, updated_at) VALUES (?,?,?,?)")) {
+                    for (Map.Entry<String, String> e : answers.entrySet()) {
+                        String answer = e.getValue();
+                        if (answer == null || answer.isBlank()) {
+                            continue;
+                        }
+                        ins.setString(1, uuid.toString());
+                        ins.setString(2, e.getKey());
+                        ins.setString(3, answer);
+                        ins.setLong(4, now);
+                        ins.executeUpdate();
+                    }
+                }
+            } catch (SQLException e) {
+                throw fail("setPrompts", e);
+            }
+        }
+    }
+
+    private String scalar(String sql, UUID uuid) throws SQLException {
+        try (PreparedStatement ps = conn().prepareStatement(sql)) {
+            ps.setString(1, uuid.toString());
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? rs.getString(1) : null;
+            }
+        }
+    }
+
+    // moderation
+    boolean isBanned(UUID uuid) {
+        try (Reader r = read()) {
+            try (PreparedStatement ps = conn().prepareStatement("SELECT banned FROM users WHERE uuid=?")) {
+                ps.setString(1, uuid.toString());
+                try (ResultSet rs = ps.executeQuery()) {
+                    return rs.next() && rs.getInt(1) != 0;
+                }
+            } catch (SQLException e) {
+                throw fail("isBanned", e);
+            }
+        }
+    }
+
+    void setBanned(UUID uuid, boolean banned, String reason) {
+        ensureUser(uuid, null);
+        synchronized (lock) {
+            try (PreparedStatement ps = conn().prepareStatement(
+                    "UPDATE users SET banned=?, ban_reason=? WHERE uuid=?")) {
+                ps.setInt(1, banned ? 1 : 0);
+                ps.setString(2, banned ? reason : null);
+                ps.setString(3, uuid.toString());
+                ps.executeUpdate();
+            } catch (SQLException e) {
+                throw fail("setBanned", e);
+            }
+        }
+        if (banned) {
+            revokeSessions(uuid);
+        }
+    }
+
+    void revokeSessions(UUID uuid) {
+        synchronized (lock) {
+            try (PreparedStatement ps = conn().prepareStatement("DELETE FROM sessions WHERE uuid=?")) {
+                ps.setString(1, uuid.toString());
+                ps.executeUpdate();
+            } catch (SQLException e) {
+                throw fail("revokeSessions", e);
+            }
+        }
+    }
+
+    // admin
+    void scrubProfile(UUID uuid) {
+        setBio(uuid, "");
+        setPrompts(uuid, Map.of());
+    }
+
+    // reports
+    void addReport(UUID reporter, UUID target, String reason) {
+        String targetUsername = null;
+        String targetBio = null;
+        synchronized (lock) {
+            try {
+                try (PreparedStatement ps = conn().prepareStatement(
+                        "SELECT 1 FROM reports WHERE reporter_uuid=? AND target_uuid=? AND status='open' LIMIT 1")) {
+                    ps.setString(1, reporter.toString());
+                    ps.setString(2, target.toString());
+                    try (ResultSet rs = ps.executeQuery()) {
+                        if (rs.next()) {
+                            return;
+                        }
+                    }
+                }
+                try (PreparedStatement ps = conn().prepareStatement(
+                        "INSERT INTO reports (reporter_uuid, target_uuid, reason, status, created_at) "
+                                + "VALUES (?,?,?, 'open', ?)")) {
+                    ps.setString(1, reporter.toString());
+                    ps.setString(2, target.toString());
+                    ps.setString(3, reason);
+                    ps.setLong(4, System.currentTimeMillis());
+                    ps.executeUpdate();
+                }
+                targetUsername = scalar("SELECT username FROM users WHERE uuid=?", target);
+                targetBio = scalar("SELECT text FROM profile_bio WHERE uuid=?", target);
+            } catch (SQLException e) {
+                throw fail("addReport", e);
+            }
+        }
+        notifyReportWebhook(reporter, target, targetUsername, targetBio, reason);
+    }
+
+    private void notifyReportWebhook(UUID reporter, UUID target, String username, String bio, String reason) {
+        if (discordWebhook == null || discordWebhook.isBlank()) {
+            return;
+        }
+        try {
+            List<Object> fields = new ArrayList<>();
+            fields.add(Map.of("name", "Reported user",
+                    "value", (username == null || username.isBlank() ? "?" : username) + " (`" + target + "`)"));
+            fields.add(Map.of("name", "Reason", "value", reason));
+            fields.add(Map.of("name", "Current bio",
+                    "value", (bio == null || bio.isBlank()) ? "(empty)" : bio));
+            fields.add(Map.of("name", "Reported by", "value", "`" + reporter + "`"));
+            Map<String, Object> embed = new LinkedHashMap<>();
+            embed.put("title", "New report");
+            embed.put("color", 15158332);
+            embed.put("fields", fields);
+            Map<String, Object> payload = new LinkedHashMap<>();
+            payload.put("username", "LAN+ Moderation");
+            payload.put("embeds", List.of(embed));
+            HttpRequest req = HttpRequest.newBuilder(URI.create(discordWebhook))
+                    .timeout(Duration.ofSeconds(5))
+                    .header("Content-Type", "application/json")
+                    .POST(HttpRequest.BodyPublishers.ofString(Json.write(payload), StandardCharsets.UTF_8))
+                    .build();
+            httpClient.sendAsync(req, HttpResponse.BodyHandlers.discarding())
+                    .exceptionally(e -> {
+                        BackendServer.log("discord webhook failed: " + e);
+                        return null;
+                    });
+        } catch (RuntimeException e) {
+            BackendServer.log("discord webhook error: " + e);
+        }
+    }
+
+    List<Object> openReports() {
+        List<Object> out = new ArrayList<>();
+        synchronized (lock) {
+            try (PreparedStatement ps = conn().prepareStatement(
+                    "SELECT r.id, r.reporter_uuid, r.target_uuid, r.reason, r.created_at, u.username, b.text "
+                            + "FROM reports r "
+                            + "LEFT JOIN users u ON u.uuid = r.target_uuid "
+                            + "LEFT JOIN profile_bio b ON b.uuid = r.target_uuid "
+                            + "WHERE r.status='open' ORDER BY r.created_at ASC");
+                 ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    out.add(ordered(
+                            "id", rs.getLong(1),
+                            "reporterUuid", rs.getString(2),
+                            "targetUuid", rs.getString(3),
+                            "reason", rs.getString(4),
+                            "createdAt", rs.getLong(5),
+                            "targetUsername", rs.getString(6),
+                            "targetBio", rs.getString(7)));
+                }
+            } catch (SQLException e) {
+                throw fail("openReports", e);
+            }
+        }
+        return out;
+    }
+
+    boolean resolveReport(long id) {
+        synchronized (lock) {
+            try (PreparedStatement ps = conn().prepareStatement(
+                    "UPDATE reports SET status='resolved' WHERE id=? AND status='open'")) {
+                ps.setLong(1, id);
+                return ps.executeUpdate() > 0;
+            } catch (SQLException e) {
+                throw fail("resolveReport", e);
+            }
+        }
+    }
+
+    // invites
+    String createInvite(UUID hostUuid, String address, String worldName, boolean gated) {
+        long expiresAt = System.currentTimeMillis() + 3_600_000;
+        String guestAddress = address;
+        if (gated && hostUuid != null) {
+            String hostDomain = ensureUser(hostUuid, null).domain;
+            String token = uniqueGuestToken();
+            guestTokens.put(token, new GuestToken(hostDomain, expiresAt));
+            guestAddress = token + "." + baseDomain + portSuffix(address);
+        }
+        String code;
+        do {
+            code = randomCode();
+        } while (invites.putIfAbsent(code, new Invite(hostUuid, guestAddress, worldName, expiresAt)) != null);
+        return code;
+    }
+
+    private void renewInvite(String code, long expiresAt) {
+        Invite i = invites.computeIfPresent(code,
+                (k, v) -> new Invite(v.hostUuid(), v.address(), v.worldName(), expiresAt));
+        if (i == null) {
+            return;
+        }
+        int dot = i.address().indexOf('.');
+        if (dot > 0) {
+            guestTokens.computeIfPresent(i.address().substring(0, dot),
+                    (k, v) -> new GuestToken(v.hostDomain(), expiresAt));
+        }
+    }
+
+    String validateGuestToken(String token) {
+        if (token == null || token.isBlank()) {
+            return null;
+        }
+        GuestToken t = guestTokens.get(token);
+        if (t == null || System.currentTimeMillis() > t.expiresAt()) {
+            return null;
+        }
+        return t.hostDomain();
+    }
+
+    Invite invite(String code) {
+        Invite i = invites.get(code);
+        return (i == null || System.currentTimeMillis() > i.expiresAt()) ? null : i;
+    }
+
+    Map<String, Object> resolveInvite(String code) {
+        Invite i = invite(code);
+        return i == null ? null : ordered("address", i.address(), "worldName", i.worldName());
+    }
+
+    // relay tickets
+    Object[] mintTicketToken(UUID uuid, boolean gated) {
+        User u = ensureUser(uuid, null);
+        String token = randomHex(32);
+        Ticket t = new Ticket(uuid, u.domain, gated, System.currentTimeMillis() + 3_600_000);
+        tickets.put(token, t);
+        return new Object[]{token, t};
+    }
+
+    Ticket validateTicket(String token) {
+        Ticket t = tickets.get(token);
+        if (t == null || System.currentTimeMillis() > t.expiresAt()) {
+            return null;
+        }
+        return t;
+    }
+
+    // auth / sessions
+    boolean isOfflineAllowed() {
+        return allowOffline;
+    }
+
+    String newChallenge() {
+        String serverId = randomHex(20);
+        challenges.put(serverId, System.currentTimeMillis() + CHALLENGE_TTL_MS);
+        return serverId;
+    }
+
+    AuthResult authVerify(String username, String serverId) {
+        if (serverId == null || serverId.isBlank()) {
+            return null;
+        }
+        Long expiry = challenges.remove(serverId);
+        if (expiry == null || System.currentTimeMillis() > expiry) {
+            return null;
+        }
+        UUID uuid = mojangHasJoined(username, serverId);
+        if (uuid == null) {
+            return null;
+        }
+        ensureUser(uuid, username);
+        return issueSession(uuid, true);
+    }
+
+    AuthResult authOffline(String username) {
+        UUID uuid = offlineUuid(username);
+        ensureUser(uuid, username);
+        return issueSession(uuid, false);
+    }
+
+    static UUID offlineUuid(String username) {
+        return UUID.nameUUIDFromBytes(("OfflinePlayer:" + username).getBytes(StandardCharsets.UTF_8));
+    }
+
+    private static String safeName(UUID uuid, String username) {
+        if (uuid.version() == 3 && ContentFilter.isBlocked(username)) {
+            return "Player-" + uuid.toString().substring(0, 4);
+        }
+        return username;
+    }
+
+    Session validateSession(String token) {
+        if (token == null || token.isBlank()) {
+            return null;
+        }
+        String hash = sha256Hex(token);
+        try (Reader r = read()) {
+            try (PreparedStatement ps = conn().prepareStatement(
+                    "SELECT uuid, verified, expires_at FROM sessions WHERE token_hash=?")) {
+                ps.setString(1, hash);
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (!rs.next() || System.currentTimeMillis() > rs.getLong(3)) {
+                        return null;
+                    }
+                    return new Session(UUID.fromString(rs.getString(1)), rs.getInt(2) != 0);
+                }
+            } catch (SQLException e) {
+                throw fail("validateSession", e);
+            }
+        }
+    }
+
+    private AuthResult issueSession(UUID uuid, boolean verified) {
+        String token = randomHex(32);
+        long now = System.currentTimeMillis();
+        synchronized (lock) {
+            try (PreparedStatement ps = conn().prepareStatement(
+                    "INSERT INTO sessions (token_hash, uuid, verified, created_at, expires_at) VALUES (?,?,?,?,?)")) {
+                ps.setString(1, sha256Hex(token));
+                ps.setString(2, uuid.toString());
+                ps.setInt(3, verified ? 1 : 0);
+                ps.setLong(4, now);
+                ps.setLong(5, now + sessionTtlMs);
+                ps.executeUpdate();
+            } catch (SQLException e) {
+                throw fail("issueSession", e);
+            }
+        }
+        return new AuthResult(token, uuid, verified, sessionTtlMs / 1000);
+    }
+
+    private UUID mojangHasJoined(String username, String serverId) {
+        if (username == null || username.isBlank()) {
+            return null;
+        }
+        try {
+            String url = sessionServerUrl + "/session/minecraft/hasJoined?username="
+                    + URLEncoder.encode(username, StandardCharsets.UTF_8)
+                    + "&serverId=" + URLEncoder.encode(serverId, StandardCharsets.UTF_8);
+            HttpRequest req = HttpRequest.newBuilder(URI.create(url))
+                    .timeout(Duration.ofSeconds(5))
+                    .GET()
+                    .build();
+            HttpResponse<String> resp = httpClient.send(req, HttpResponse.BodyHandlers.ofString());
+            if (resp.statusCode() != 200) {
+                return null;
+            }
+            Object id = Json.parseObject(resp.body()).get("id");
+            return id instanceof String s ? uuidFromUndashed(s) : null;
+        } catch (Exception e) {
+            BackendServer.log("hasJoined check failed: " + e);
+            return null;
+        }
+    }
+
+    private static UUID uuidFromUndashed(String s) {
+        if (s == null || s.length() != 32) {
+            return null;
+        }
+        try {
+            return UUID.fromString(s.substring(0, 8) + "-" + s.substring(8, 12) + "-" + s.substring(12, 16)
+                    + "-" + s.substring(16, 20) + "-" + s.substring(20, 32));
+        } catch (IllegalArgumentException e) {
+            return null;
+        }
+    }
+
+    private static String sha256Hex(String s) {
+        return sha256Hex(s.getBytes(StandardCharsets.UTF_8));
+    }
+
+    static String sha256Hex(byte[] data) {
+        try {
+            byte[] d = MessageDigest.getInstance("SHA-256").digest(data);
+            StringBuilder sb = new StringBuilder(d.length * 2);
+            for (byte b : d) {
+                sb.append(Character.forDigit((b >> 4) & 0xF, 16)).append(Character.forDigit(b & 0xF, 16));
+            }
+            return sb.toString();
+        } catch (Exception e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
+    void sweep() {
+        long now = System.currentTimeMillis();
+        invites.entrySet().removeIf(e -> now > e.getValue().expiresAt());
+        tickets.entrySet().removeIf(e -> now > e.getValue().expiresAt());
+        guestTokens.entrySet().removeIf(e -> now > e.getValue().expiresAt());
+        challenges.entrySet().removeIf(e -> now > e.getValue());
+        sweepSessions(now);
+        for (Map.Entry<UUID, Presence> e : presences.entrySet()) {
+            Presence p = e.getValue();
+            if (!p.disconnectRecorded && now - p.lastHeartbeat > 2 * ttlMs) {
+                p.disconnectRecorded = true;
+                p.onlinePersisted = false;
+                markOffline(e.getKey(), p.lastHeartbeat);
+            }
+        }
+    }
+
+    private void sweepSessions(long now) {
+        synchronized (lock) {
+            try (PreparedStatement ps = conn().prepareStatement("DELETE FROM sessions WHERE expires_at < ?")) {
+                ps.setLong(1, now);
+                ps.executeUpdate();
+            } catch (SQLException e) {
+                BackendServer.log("SQLite error (sweepSessions): " + e.getMessage());
+            }
+        }
+    }
+
+    // helpers
+    private static final String CODE_ALPHABET = "23456789ABCDEFGHJKMNPQRSTVWXYZ"; // no 0/1 or I/L/O/U
+
+    private User findUser(UUID uuid) throws SQLException {
+        try (PreparedStatement ps = conn().prepareStatement(
+                "SELECT username, friend_code, domain FROM users WHERE uuid=?")) {
+            ps.setString(1, uuid.toString());
+            try (ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) {
+                    return new User(uuid, rs.getString(1), rs.getString(2), rs.getString(3));
+                }
+                return null;
+            }
+        }
+    }
+
+    // caller holds lock
+    private String uniqueFriendCode() throws SQLException {
+        String code;
+        int attempts = 0;
+        do {
+            if (++attempts > 10_000) {
+                throw new IllegalStateException("LAN+ backend: exhausted friend code space");
+            }
+            code = "LAN-" + randomFrom(CODE_ALPHABET, 5);
+        } while (friendCodeTaken(code));
+        return code;
+    }
+
+    private boolean friendCodeTaken(String code) throws SQLException {
+        try (PreparedStatement ps = conn().prepareStatement(
+                "SELECT 1 FROM users WHERE friend_code=?")) {
+            ps.setString(1, code);
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next();
+            }
+        }
+    }
+
+    private String uniqueDomain() throws SQLException {
+        for (int i = 0; i < 200; i++) {
+            String domain = WORDS[RNG.nextInt(WORDS.length)] + "-" + WORDS[RNG.nextInt(WORDS.length)] + "." + baseDomain;
+            if (!domainTaken(domain)) {
+                return domain;
+            }
+        }
+        for (int i = 0; i < 500; i++) {
+            String domain = WORDS[RNG.nextInt(WORDS.length)] + "-"
+                    + WORDS[RNG.nextInt(WORDS.length)] + "-"
+                    + WORDS[RNG.nextInt(WORDS.length)] + "." + baseDomain;
+            if (!domainTaken(domain)) {
+                return domain;
+            }
+        }
+        return UUID.randomUUID().toString().replace("-", "").substring(0, 16) + "." + baseDomain;
+    }
+
+    private boolean domainTaken(String domain) throws SQLException {
+        try (PreparedStatement ps = conn().prepareStatement(
+                "SELECT 1 FROM users WHERE domain=?")) {
+            ps.setString(1, domain);
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next();
+            }
+        }
+    }
+
+    private static String[] normalize(UUID a, UUID b) {
+        String x = a.toString();
+        String y = b.toString();
+        return x.compareTo(y) <= 0 ? new String[]{x, y} : new String[]{y, x};
+    }
+
+    private static String randomFrom(String alphabet, int len) {
+        StringBuilder sb = new StringBuilder(len);
+        for (int i = 0; i < len; i++) {
+            sb.append(alphabet.charAt(RNG.nextInt(alphabet.length())));
+        }
+        return sb.toString();
+    }
+
+    private String uniqueGuestToken() {
+        String token;
+        do {
+            token = "g" + randomHex(10);
+        } while (guestTokens.containsKey(token));
+        return token;
+    }
+
+    private static String portSuffix(String address) {
+        if (address == null) {
+            return "";
+        }
+        int colon = address.lastIndexOf(':');
+        if (colon < 0) {
+            return "";
+        }
+        String port = address.substring(colon + 1).trim();
+        return port.matches("\\d+") ? ":" + port : "";
+    }
+
+    private static String randomCode() {
+        String alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+        StringBuilder sb = new StringBuilder(6);
+        for (int i = 0; i < 6; i++) {
+            sb.append(alphabet.charAt(RNG.nextInt(alphabet.length())));
+        }
+        return sb.toString();
+    }
+
+    private static String randomHex(int bytes) {
+        byte[] b = new byte[bytes];
+        RNG.nextBytes(b);
+        StringBuilder sb = new StringBuilder(bytes * 2);
+        for (byte x : b) {
+            sb.append(Character.forDigit((x >> 4) & 0xF, 16)).append(Character.forDigit(x & 0xF, 16));
+        }
+        return sb.toString();
+    }
+
+    private static RuntimeException fail(String what, SQLException e) {
+        BackendServer.log("SQLite error (" + what + "): " + e.getMessage());
+        return new RuntimeException(e);
+    }
+
+    private static Map<String, Object> ordered(Object... kv) {
+        Map<String, Object> m = new LinkedHashMap<>();
+        for (int i = 0; i + 1 < kv.length; i += 2) {
+            m.put(String.valueOf(kv[i]), kv[i + 1]);
+        }
+        return m;
+    }
+}
