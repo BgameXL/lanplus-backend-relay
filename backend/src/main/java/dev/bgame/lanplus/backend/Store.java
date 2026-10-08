@@ -985,6 +985,128 @@ final class Store {
         return worlds;
     }
 
+    boolean isFofHost(UUID host) {
+        Presence p = presences.get(host);
+        return p != null && p.hosting && "FRIENDS_OF_FRIENDS".equals(p.accessMode);
+    }
+
+    boolean isDiscoverable(UUID uuid) {
+        try (Reader r = read()) {
+            return discoverableLocked(uuid);
+        }
+    }
+
+    boolean isSecondDegree(UUID host, UUID guest) {
+        if (host == null || guest == null) {
+            return false;
+        }
+        if (host.equals(guest)) {
+            return true;
+        }
+        if (isBlocked(host, guest) || isBlocked(guest, host)) {
+            return false;
+        }
+        Set<UUID> hostFriends = friendsOf(host);
+        if (hostFriends.contains(guest)) {
+            return true;
+        }
+        Set<UUID> guestFriends = friendsOf(guest);
+        for (UUID w : hostFriends) {
+            if (guestFriends.contains(w)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    Set<UUID> secondDegreeOf(UUID host) {
+        Set<UUID> out = new LinkedHashSet<>();
+        if (host == null) {
+            return out;
+        }
+        try (Reader r = read()) {
+            Set<UUID> hostFriends = friendsOf(host);
+            if (hostFriends.isEmpty()) {
+                return out;
+            }
+            for (UUID f : hostFriends) {
+                for (UUID fof : friendsOf(f)) {
+                    if (!fof.equals(host) && !hostFriends.contains(fof)) {
+                        out.add(fof);
+                    }
+                }
+            }
+            out.removeIf(v -> isBlocked(host, v) || isBlocked(v, host));
+        }
+        return out;
+    }
+
+    List<Object> discoverableHosts(UUID caller) {
+        List<Object> out = new ArrayList<>();
+        if (caller == null) {
+            return out;
+        }
+        try (Reader r = read();
+             PreparedStatement user = conn().prepareStatement("SELECT username, banned FROM users WHERE uuid=?");
+             PreparedStatement nameLookup = conn().prepareStatement("SELECT username FROM users WHERE uuid=?")) {
+            Set<UUID> callerFriends = friendsOf(caller);
+            for (Map.Entry<UUID, Presence> entry : presences.entrySet()) {
+                UUID host = entry.getKey();
+                Presence p = entry.getValue();
+                if (host.equals(caller) || !p.hosting || !"FRIENDS_OF_FRIENDS".equals(p.accessMode)) {
+                    continue;
+                }
+                if (!isLive(connectivity(host)) || p.worldName == null || p.worldName.isBlank()) {
+                    continue;
+                }
+                if (callerFriends.contains(host) || invisibleLocked(host) || !discoverableLocked(host)) {
+                    continue;
+                }
+                if (isBlockedLocked(host, caller) || isBlockedLocked(caller, host)) {
+                    continue;
+                }
+                Set<UUID> hostFriends = friendsOf(host);
+                int mutualCount = 0;
+                List<String> mutualNames = new ArrayList<>();
+                for (UUID w : callerFriends) {
+                    if (hostFriends.contains(w)) {
+                        mutualCount++;
+                        if (mutualNames.size() < MUTUAL_NAMES_SHOWN) {
+                            nameLookup.setString(1, w.toString());
+                            try (ResultSet rs = nameLookup.executeQuery()) {
+                                if (rs.next()) {
+                                    mutualNames.add(rs.getString(1));
+                                }
+                            }
+                        }
+                    }
+                }
+                if (mutualCount == 0) {
+                    continue;
+                }
+                user.setString(1, host.toString());
+                try (ResultSet rs = user.executeQuery()) {
+                    if (!rs.next() || rs.getInt("banned") != 0) {
+                        continue;
+                    }
+                    out.add(ordered(
+                            "uuid", host.toString(),
+                            "username", rs.getString("username"),
+                            "worldName", p.worldName,
+                            "joinCode", p.joinCode,
+                            "gameMode", p.gameMode,
+                            "difficulty", p.difficulty,
+                            "skin", p.skin,
+                            "mutualCount", mutualCount,
+                            "mutualNames", mutualNames));
+                }
+            }
+        } catch (SQLException e) {
+            throw fail("discoverableHosts", e);
+        }
+        return out;
+    }
+
     private Long lastDisconnectLocked(UUID uuid) {
         try (PreparedStatement ps = conn().prepareStatement(
                 "SELECT last_disconnect_at FROM presence_state WHERE uuid=?")) {

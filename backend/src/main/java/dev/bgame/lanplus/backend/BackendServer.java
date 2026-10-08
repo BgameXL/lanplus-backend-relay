@@ -253,6 +253,9 @@ public final class BackendServer {
             if (m.equals("GET") && path.equals("/friends/suggestions")) {
                 return ok(store.friendSuggestions(self));
             }
+            if (m.equals("GET") && path.equals("/hosts/discoverable")) {
+                return ok(store.discoverableHosts(self));
+            }
             if (m.equals("POST") && path.equals("/cosmetics/equip")) {
                 return cosmeticEquip(req, self);
             }
@@ -457,6 +460,14 @@ public final class BackendServer {
                 }
                 hub.send(friend, ordered("type", "FRIEND_STARTED_HOSTING", "uuid", uuid.toString(),
                         "joinCode", invited ? joinCode : null));
+            }
+            if ("FRIENDS_OF_FRIENDS".equalsIgnoreCase((String) b.get("accessMode")) && store.isDiscoverable(uuid)) {
+                for (UUID peer : store.secondDegreeOf(uuid)) {
+                    if (!store.isMutedOrBlocked(peer, uuid)) {
+                        hub.send(peer, ordered("type", "DISCOVERABLE_HOST_STARTED",
+                                "uuid", uuid.toString(), "joinCode", joinCode));
+                    }
+                }
             }
         }
         return OK_EMPTY;
@@ -1143,6 +1154,11 @@ public final class BackendServer {
         }
         Store.Invite invite = store.invite(code);
         if (invite != null && invite.hostUuid() != null) {
+            if (guestUuid != null && store.isFofHost(invite.hostUuid())
+                    && !store.isSecondDegree(invite.hostUuid(), guestUuid)) {
+                log("invite " + code + " rejected: " + guestUuid + " not in 2nd-degree of host " + invite.hostUuid());
+                return FORBIDDEN;
+            }
             hub.send(invite.hostUuid(), ordered("type", "INVITE_REDEEMED",
                     "guestUuid", guestUuid.toString(), "code", code));
             log("invite " + code + " redeemed by " + guestUuid + " -> host " + invite.hostUuid());
