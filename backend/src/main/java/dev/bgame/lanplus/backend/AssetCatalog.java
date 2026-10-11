@@ -13,7 +13,7 @@ import java.util.stream.Stream;
 
 final class AssetCatalog {
 
-    static final int MAX_BYTES = 512 * 1024;
+    static final int MAX_BYTES = 5 * 1024 * 1024;
     private static final Pattern ID = Pattern.compile("[a-z0-9_-]{1,64}");
 
     private final Path dir;
@@ -94,6 +94,20 @@ final class AssetCatalog {
             return hash(id);
         } catch (IOException e) {
             return null;
+        }
+    }
+
+    synchronized boolean delete(String id) {
+        Path file = fileOf(id);
+        if (file == null) {
+            return false;
+        }
+        try {
+            boolean removed = Files.deleteIfExists(file);
+            hashes.remove(id);
+            return removed;
+        } catch (IOException e) {
+            return false;
         }
     }
 

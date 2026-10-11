@@ -11,7 +11,7 @@ import java.util.Map;
 
 final class Http {
 
-    private static final int MAX_BODY = 1024 * 1024;
+    private static final int MAX_BODY = 8 * 1024 * 1024;
 
     private Http() {
     }
@@ -95,6 +95,10 @@ final class Http {
         if (cacheControl != null) {
             head.append("Cache-Control: ").append(cacheControl).append("\r\n");
         }
+        head.append("Access-Control-Allow-Origin: *\r\n");
+        head.append("Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n");
+        head.append("Access-Control-Allow-Headers: Content-Type, X-Admin-Key\r\n");
+        head.append("Access-Control-Max-Age: 86400\r\n");
         head.append("Connection: close\r\n\r\n");
         out.write(head.toString().getBytes(StandardCharsets.UTF_8));
         out.write(payload);

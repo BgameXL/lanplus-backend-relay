@@ -149,6 +149,9 @@ public final class BackendServer {
         String m = req.method();
         String path = req.path();
         try {
+            if (m.equals("OPTIONS")) {
+                return new Resp(204, null);
+            }
             if (m.equals("POST") && path.equals("/auth/challenge")) {
                 return authChallenge(req);
             }
@@ -201,14 +204,9 @@ public final class BackendServer {
             if (m.equals("GET") && path.equals("/public/worlds")) {
                 return ok(store.publicWorlds());
             }
-            if (m.equals("GET") && path.equals("/admin/panel")) {
-                return new Resp(200, null,
-                        AdminPanel.HTML.getBytes(java.nio.charset.StandardCharsets.UTF_8),
-                        "text/html; charset=utf-8");
-            }
             if (path.startsWith("/admin/") && !cfg.adminKey.isBlank()
                     && cfg.adminKey.equals(req.headers().get("x-admin-key"))) {
-                return adminRoute(m, path, req);
+                return adminRoute(m, path, req, "key");
             }
 
             Store.Session session = store.validateSession(bearer(req));
@@ -310,7 +308,7 @@ public final class BackendServer {
                 return report(req, self);
             }
             if (path.startsWith("/admin/")) {
-                return isAdmin(self) ? adminRoute(m, path, req) : FORBIDDEN;
+                return isAdmin(self) ? adminRoute(m, path, req, self.toString()) : FORBIDDEN;
             }
             if (m.equals("POST") && path.equals("/skin")) {
                 return skinUpload(req, self);
@@ -572,7 +570,31 @@ public final class BackendServer {
         return cfg.adminUuids.contains(self);
     }
 
-    private Resp adminRoute(String m, String path, Http.Request req) {
+    private final ThreadLocal<String> auditActor = new ThreadLocal<>();
+
+    private Resp adminRoute(String m, String path, Http.Request req, String actor) {
+        auditActor.set(actor);
+        try {
+            return adminDispatch(m, path, req);
+        } finally {
+            auditActor.remove();
+        }
+    }
+
+    private void audit(String action, String target, String detail) {
+        store.addAudit(auditActor.get(), action, target, detail);
+    }
+
+    private Resp adminDispatch(String m, String path, Http.Request req) {
+        if (m.equals("GET") && path.equals("/admin/audit")) {
+            return ok(store.listAudit(200));
+        }
+        if (m.equals("GET") && path.equals("/admin/stats")) {
+            return adminStats();
+        }
+        if (m.equals("GET") && path.equals("/admin/user")) {
+            return adminUser(req);
+        }
         if (m.equals("POST") && path.equals("/admin/scrub")) {
             return adminScrub(req);
         }
@@ -599,6 +621,15 @@ public final class BackendServer {
         }
         if (m.equals("POST") && path.equals("/admin/banner-image")) {
             return adminImageUpload(banners, "banner", req);
+        }
+        if (m.equals("POST") && path.equals("/admin/announcement-image/delete")) {
+            return adminImageDelete(announcementImages, "announcement", req);
+        }
+        if (m.equals("POST") && path.equals("/admin/background/delete")) {
+            return adminImageDelete(backgrounds, "background", req);
+        }
+        if (m.equals("POST") && path.equals("/admin/banner/delete")) {
+            return adminImageDelete(banners, "banner", req);
         }
         if (m.equals("GET") && path.equals("/admin/backgrounds")) {
             return ok(backgrounds.list());
@@ -637,6 +668,7 @@ public final class BackendServer {
         }
         store.deactivateAnnouncement(n.intValue());
         hub.sendAll(ordered("type", "ANNOUNCEMENT_DELETE", "data", ordered("id", n.intValue())));
+        audit("announcement.delete", String.valueOf(n.intValue()), null);
         log("admin announcement deleted: " + n.intValue());
         return ok(ordered("success", true));
     }
@@ -672,11 +704,13 @@ public final class BackendServer {
         }
         Map<String, Object> row = store.publishAnnouncement(type, title, body, imageId);
         hub.sendAll(ordered("type", "ANNOUNCEMENT", "data", row));
+        audit("announcement.publish", title, type);
         log("admin announcement published: " + type + " / " + title);
         return ok(row);
     }
 
     private static final int MAX_IMAGE_B64_CHARS = 700 * 1024;
+    private static final int MAX_CATALOG_B64_CHARS = (AssetCatalog.MAX_BYTES + 2) / 3 * 4 + 16;
     private static final int MAX_IMAGE_DIM = 4096;
 
     private Map<String, Object> versionEvent() {
@@ -691,6 +725,7 @@ public final class BackendServer {
         latestVersion = s.trim();
         store.setMeta(latestVersion);
         hub.sendAll(versionEvent());
+        audit("version.set", latestVersion, null);
         log("latest version set: " + latestVersion);
         return OK_EMPTY;
     }
@@ -735,8 +770,41 @@ public final class BackendServer {
         if (!cosmetics3d.writeBundle(id, geo, texture, anim, meta)) {
             return ok(error("write_failed"));
         }
+        audit("cosmetic.upload", id, null);
         log("admin cosmetic uploaded: " + id);
         return ok(ordered("id", id));
+    }
+
+    private Resp adminStats() {
+        Map<String, Object> out = new LinkedHashMap<>(store.adminStats());
+        out.put("backgrounds", backgrounds.list().size());
+        out.put("banners", banners.list().size());
+        out.put("announcementImages", announcementImages.list().size());
+        out.put("cosmetics3d", cosmetics3d.catalog().size());
+        return ok(out);
+    }
+
+    private Resp adminUser(Http.Request req) {
+        UUID target = uuid(req.param("uuid"));
+        if (target == null) {
+            return BAD;
+        }
+        Map<String, Object> u = store.adminUser(target);
+        return u == null ? NOT_FOUND : ok(u);
+    }
+
+    private Resp adminImageDelete(AssetCatalog catalog, String label, Http.Request req) {
+        Map<String, Object> b = Json.parseObject(req.body());
+        String id = b.get("id") == null ? null : String.valueOf(b.get("id"));
+        if (!AssetCatalog.validId(id)) {
+            return ok(error("bad_id"));
+        }
+        if (!catalog.delete(id)) {
+            return ok(error("not_found"));
+        }
+        audit(label + "-image.delete", id, null);
+        log("admin " + label + " image deleted: " + id);
+        return ok(ordered("success", true));
     }
 
     private Resp adminCosmeticDelete(Http.Request req) {
@@ -748,6 +816,7 @@ public final class BackendServer {
         if (!cosmetics3d.delete(id)) {
             return ok(error("not_found"));
         }
+        audit("cosmetic.delete", id, null);
         log("admin cosmetic deleted: " + id);
         return ok(ordered("success", true));
     }
@@ -761,7 +830,7 @@ public final class BackendServer {
         if (!(b.get("png") instanceof String b64) || b64.isEmpty()) {
             return ok(error("bad_png"));
         }
-        if (b64.length() > MAX_IMAGE_B64_CHARS) {
+        if (b64.length() > MAX_CATALOG_B64_CHARS) {
             return ok(error("too_large"));
         }
         byte[] png;
@@ -784,6 +853,7 @@ public final class BackendServer {
         if (hash == null) {
             return ok(error("write_failed"));
         }
+        audit(label + "-image.upload", id, null);
         log("admin " + label + " image uploaded: " + id);
         return ok(ordered("id", id, "url", catalog.url(id), "hash", hash));
     }
@@ -791,6 +861,7 @@ public final class BackendServer {
     private Resp adminScrub(Http.Request req) {
         Map<String, Object> b = Json.parseObject(req.body());
         store.scrubProfile(uuid((String) b.get("targetUuid")));
+        audit("profile.scrub", String.valueOf(b.get("targetUuid")), null);
         return ok(Map.of("success", true));
     }
 
@@ -799,6 +870,7 @@ public final class BackendServer {
         UUID target = uuid((String) b.get("targetUuid"));
         String reason = b.get("reason") == null ? null : String.valueOf(b.get("reason"));
         store.setBanned(target, true, reason);
+        audit("ban", target.toString(), reason);
         log("admin ban " + target + (reason != null ? " (" + reason + ")" : ""));
         return ok(Map.of("success", true));
     }
@@ -807,6 +879,7 @@ public final class BackendServer {
         Map<String, Object> b = Json.parseObject(req.body());
         UUID target = uuid((String) b.get("targetUuid"));
         store.setBanned(target, false, null);
+        audit("unban", target.toString(), null);
         log("admin unban " + target);
         return ok(Map.of("success", true));
     }
@@ -815,7 +888,9 @@ public final class BackendServer {
         Map<String, Object> b = Json.parseObject(req.body());
         Object idObj = b.get("id");
         long id = idObj instanceof Number n ? n.longValue() : Long.parseLong(String.valueOf(idObj));
-        return ok(Map.of("success", store.resolveReport(id)));
+        boolean resolved = store.resolveReport(id);
+        audit("report.resolve", String.valueOf(id), null);
+        return ok(Map.of("success", resolved));
     }
 
     private static final java.util.Set<String> COSMETIC_SLOTS = java.util.Set.of(

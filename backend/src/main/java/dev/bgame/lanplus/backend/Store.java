@@ -282,6 +282,10 @@ final class Store {
                 st.executeUpdate("CREATE INDEX IF NOT EXISTS idx_sessions_uuid ON sessions(uuid)");
                 st.executeUpdate("CREATE TABLE IF NOT EXISTS meta ("
                         + "key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+                st.executeUpdate("CREATE TABLE IF NOT EXISTS admin_audit ("
+                        + "id INTEGER PRIMARY KEY AUTOINCREMENT, actor TEXT, action TEXT NOT NULL, "
+                        + "target TEXT, detail TEXT, created_at INTEGER NOT NULL)");
+                st.executeUpdate("CREATE INDEX IF NOT EXISTS idx_admin_audit_created ON admin_audit(created_at)");
                 if (columnExists(st, "users", "last_seen")) {
                     st.executeUpdate("ALTER TABLE users DROP COLUMN last_seen");
                 }
@@ -2826,6 +2830,104 @@ final class Store {
                     });
         } catch (RuntimeException e) {
             BackendServer.log("discord webhook error: " + e);
+        }
+    }
+
+    void addAudit(String actor, String action, String target, String detail) {
+        synchronized (lock) {
+            try (PreparedStatement ps = conn().prepareStatement(
+                    "INSERT INTO admin_audit (actor, action, target, detail, created_at) VALUES (?,?,?,?,?)")) {
+                ps.setString(1, actor);
+                ps.setString(2, action);
+                ps.setString(3, target);
+                ps.setString(4, detail);
+                ps.setLong(5, System.currentTimeMillis());
+                ps.executeUpdate();
+            } catch (SQLException e) {
+                throw fail("addAudit", e);
+            }
+        }
+    }
+
+    List<Object> listAudit(int limit) {
+        List<Object> out = new ArrayList<>();
+        synchronized (lock) {
+            try (PreparedStatement ps = conn().prepareStatement(
+                    "SELECT actor, action, target, detail, created_at FROM admin_audit ORDER BY id DESC LIMIT ?")) {
+                ps.setInt(1, Math.max(1, Math.min(limit, 500)));
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        out.add(ordered("actor", rs.getString(1), "action", rs.getString(2),
+                                "target", rs.getString(3), "detail", rs.getString(4), "at", rs.getLong(5)));
+                    }
+                }
+            } catch (SQLException e) {
+                throw fail("listAudit", e);
+            }
+        }
+        return out;
+    }
+
+    Map<String, Object> adminUser(UUID uuid) {
+        Map<String, Object> out = new LinkedHashMap<>();
+        synchronized (lock) {
+            try (PreparedStatement ps = conn().prepareStatement(
+                    "SELECT username, friend_code, domain, last_modpack, banned, ban_reason FROM users WHERE uuid=?")) {
+                ps.setString(1, uuid.toString());
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (!rs.next()) {
+                        return null;
+                    }
+                    out.put("uuid", uuid.toString());
+                    out.put("username", rs.getString(1));
+                    out.put("friendCode", rs.getString(2));
+                    out.put("domain", rs.getString(3));
+                    out.put("lastModpack", rs.getString(4));
+                    out.put("banned", rs.getInt(5) != 0);
+                    out.put("banReason", rs.getString(6));
+                }
+            } catch (SQLException e) {
+                throw fail("adminUser", e);
+            }
+            try {
+                long xp = totalXpLocked(uuid);
+                out.put("xp", xp);
+                out.put("tier", tierFor(xp));
+                out.put("balance", Math.max(0, xp - spentLocked(uuid)));
+            } catch (SQLException e) {
+                throw fail("adminUser", e);
+            }
+            try (PreparedStatement ps = conn().prepareStatement(
+                    "SELECT COUNT(*) FROM reports WHERE target_uuid=? AND status='open'")) {
+                ps.setString(1, uuid.toString());
+                try (ResultSet rs = ps.executeQuery()) {
+                    out.put("openReports", rs.next() ? rs.getLong(1) : 0L);
+                }
+            } catch (SQLException e) {
+                throw fail("adminUser", e);
+            }
+        }
+        out.put("loadout", cosmeticLoadout(uuid));
+        return out;
+    }
+
+    Map<String, Object> adminStats() {
+        Map<String, Object> out = new LinkedHashMap<>();
+        synchronized (lock) {
+            out.put("users", countLocked("SELECT COUNT(*) FROM users"));
+            out.put("banned", countLocked("SELECT COUNT(*) FROM users WHERE banned<>0"));
+            out.put("openReports", countLocked("SELECT COUNT(*) FROM reports WHERE status='open'"));
+            out.put("online", countLocked("SELECT COUNT(*) FROM presence_state WHERE online<>0"));
+            out.put("cosmeticsOwned", countLocked("SELECT COUNT(*) FROM cosmetic_ownership"));
+        }
+        return out;
+    }
+
+    private long countLocked(String sql) {
+        try (PreparedStatement ps = conn().prepareStatement(sql); ResultSet rs = ps.executeQuery()) {
+            return rs.next() ? rs.getLong(1) : 0;
+        } catch (SQLException e) {
+            throw fail("countLocked", e);
         }
     }
 
