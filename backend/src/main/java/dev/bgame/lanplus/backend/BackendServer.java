@@ -592,6 +592,10 @@ public final class BackendServer {
         if (m.equals("GET") && path.equals("/admin/stats")) {
             return adminStats();
         }
+        if (m.equals("GET") && path.equals("/admin/users")) {
+            String q = req.param("q");
+            return ok(store.adminSearchUsers(q == null ? "" : q.trim(), 100));
+        }
         if (m.equals("GET") && path.equals("/admin/user")) {
             return adminUser(req);
         }

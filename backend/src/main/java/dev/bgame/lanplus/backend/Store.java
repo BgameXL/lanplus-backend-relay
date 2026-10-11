@@ -2868,6 +2868,40 @@ final class Store {
         return out;
     }
 
+    List<Object> adminSearchUsers(String q, int limit) {
+        List<Object> out = new ArrayList<>();
+        int lim = Math.max(1, Math.min(limit, 200));
+        synchronized (lock) {
+            try (PreparedStatement ps = q.isEmpty()
+                    ? conn().prepareStatement(
+                            "SELECT uuid, username, friend_code, banned FROM users "
+                                    + "ORDER BY username COLLATE NOCASE LIMIT ?")
+                    : conn().prepareStatement(
+                            "SELECT uuid, username, friend_code, banned FROM users "
+                                    + "WHERE username LIKE ? COLLATE NOCASE OR friend_code LIKE ? COLLATE NOCASE "
+                                    + "OR uuid = ? ORDER BY username COLLATE NOCASE LIMIT ?")) {
+                if (q.isEmpty()) {
+                    ps.setInt(1, lim);
+                } else {
+                    String like = "%" + q + "%";
+                    ps.setString(1, like);
+                    ps.setString(2, like);
+                    ps.setString(3, q);
+                    ps.setInt(4, lim);
+                }
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        out.add(ordered("uuid", rs.getString(1), "username", rs.getString(2),
+                                "friendCode", rs.getString(3), "banned", rs.getInt(4) != 0));
+                    }
+                }
+            } catch (SQLException e) {
+                throw fail("adminSearchUsers", e);
+            }
+        }
+        return out;
+    }
+
     Map<String, Object> adminUser(UUID uuid) {
         Map<String, Object> out = new LinkedHashMap<>();
         synchronized (lock) {
