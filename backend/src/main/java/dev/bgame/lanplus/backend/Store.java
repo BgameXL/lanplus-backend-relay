@@ -1732,10 +1732,10 @@ final class Store {
     private static final Set<String> VISIBILITY_COLUMNS = Set.of(
             "favorite_modpack_visible", "currently_playing_visible", "recently_played_visible");
 
-    private static final Set<String> BACKGROUND_STYLES = Set.of("DARK", "SOLID", "MINECRAFT", "IMAGE");
+    private static final Set<String> BACKGROUND_STYLES = Set.of("DARK", "SOLID", "MINECRAFT", "IMAGE", "NONE");
     static final String DEFAULT_BG_STYLE = "DARK";
     static final int DEFAULT_BG_COLOR = 0x0A0C10;
-    static final int DEFAULT_BG_OPACITY = 92;
+    static final int DEFAULT_BG_OPACITY = 100;
 
     boolean isBackgroundStyle(String style) {
         return style != null && BACKGROUND_STYLES.contains(style);
@@ -2874,12 +2874,12 @@ final class Store {
         synchronized (lock) {
             try (PreparedStatement ps = q.isEmpty()
                     ? conn().prepareStatement(
-                            "SELECT uuid, username, friend_code, banned FROM users "
-                                    + "ORDER BY username COLLATE NOCASE LIMIT ?")
+                    "SELECT uuid, username, friend_code, banned FROM users "
+                            + "ORDER BY username COLLATE NOCASE LIMIT ?")
                     : conn().prepareStatement(
-                            "SELECT uuid, username, friend_code, banned FROM users "
-                                    + "WHERE username LIKE ? COLLATE NOCASE OR friend_code LIKE ? COLLATE NOCASE "
-                                    + "OR uuid = ? ORDER BY username COLLATE NOCASE LIMIT ?")) {
+                    "SELECT uuid, username, friend_code, banned FROM users "
+                            + "WHERE username LIKE ? COLLATE NOCASE OR friend_code LIKE ? COLLATE NOCASE "
+                            + "OR uuid = ? ORDER BY username COLLATE NOCASE LIMIT ?")) {
                 if (q.isEmpty()) {
                     ps.setInt(1, lim);
                 } else {
