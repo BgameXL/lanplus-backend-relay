@@ -41,6 +41,7 @@ final class Store {
             "elytra", "trident", "totem", "dripstone", "glowstone", "bastion", "honey", "golden", "obsidian", "netherite"
     };
     private static final SecureRandom RNG = new SecureRandom();
+    private static final long DOMAIN_COOLDOWN_MS = 7L * 24 * 60 * 60 * 1000;
 
     static final class User {
         final UUID uuid;
@@ -305,6 +306,9 @@ final class Store {
                 if (!columnExists(st, "users", "banned")) {
                     st.executeUpdate("ALTER TABLE users ADD COLUMN banned INTEGER NOT NULL DEFAULT 0");
                     st.executeUpdate("ALTER TABLE users ADD COLUMN ban_reason TEXT");
+                }
+                if (!columnExists(st, "users", "domain_changed_at")) {
+                    st.executeUpdate("ALTER TABLE users ADD COLUMN domain_changed_at INTEGER");
                 }
                 if (!columnExists(st, "profile_privacy", "discoverable")) {
                     st.executeUpdate("ALTER TABLE profile_privacy ADD COLUMN discoverable INTEGER NOT NULL DEFAULT 1");
@@ -3062,6 +3066,71 @@ final class Store {
         Ticket t = new Ticket(uuid, u.domain, gated, System.currentTimeMillis() + 3_600_000);
         tickets.put(token, t);
         return new Object[]{token, t};
+    }
+
+    Map<String, Object> domainInfo(UUID uuid) {
+        try (Reader r = read()) {
+            try (PreparedStatement ps = conn().prepareStatement(
+                    "SELECT domain, domain_changed_at FROM users WHERE uuid=?")) {
+                ps.setString(1, uuid.toString());
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (rs.next()) {
+                        long changedAt = rs.getLong(2);
+                        if (rs.wasNull()) {
+                            changedAt = 0;
+                        }
+                        return domainResponse(true, rs.getString(1), changedAt);
+                    }
+                }
+            } catch (SQLException e) {
+                throw fail("domainInfo", e);
+            }
+        }
+        return null;
+    }
+
+    Map<String, Object> rerollDomain(UUID uuid) {
+        synchronized (lock) {
+            User u = ensureUser(uuid, null);
+            try {
+                long changedAt = domainChangedAtLocked(uuid);
+                long now = System.currentTimeMillis();
+                if (now < changedAt + DOMAIN_COOLDOWN_MS) {
+                    return domainResponse(false, u.domain, changedAt);
+                }
+                String fresh = uniqueDomain();
+                try (PreparedStatement ps = conn().prepareStatement(
+                        "UPDATE users SET domain=?, domain_changed_at=? WHERE uuid=?")) {
+                    ps.setString(1, fresh);
+                    ps.setLong(2, now);
+                    ps.setString(3, uuid.toString());
+                    ps.executeUpdate();
+                }
+                addAudit(uuid.toString(), "domain.reroll", null, u.domain + " -> " + fresh);
+                return domainResponse(true, fresh, now);
+            } catch (SQLException e) {
+                throw fail("rerollDomain", e);
+            }
+        }
+    }
+
+    private Map<String, Object> domainResponse(boolean ok, String domain, long changedAt) {
+        return ordered("ok", ok, "domain", domain, "changedAt", changedAt,
+                "cooldownMs", DOMAIN_COOLDOWN_MS, "canRerollAt", changedAt + DOMAIN_COOLDOWN_MS);
+    }
+
+    private long domainChangedAtLocked(UUID uuid) throws SQLException {
+        try (PreparedStatement ps = conn().prepareStatement(
+                "SELECT domain_changed_at FROM users WHERE uuid=?")) {
+            ps.setString(1, uuid.toString());
+            try (ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) {
+                    long v = rs.getLong(1);
+                    return rs.wasNull() ? 0 : v;
+                }
+                return 0;
+            }
+        }
     }
 
     Ticket validateTicket(String token) {

@@ -352,6 +352,13 @@ public final class BackendServer {
             if (m.equals("POST") && path.equals("/relay/ticket")) {
                 return relayTicket(req, self);
             }
+            if (m.equals("GET") && path.equals("/relay/domain")) {
+                Map<String, Object> info = store.domainInfo(self);
+                return info == null ? NOT_FOUND : ok(info);
+            }
+            if (m.equals("POST") && path.equals("/relay/domain/reroll")) {
+                return ok(store.rerollDomain(self));
+            }
         } catch (RuntimeException e) {
             return BAD;
         }
