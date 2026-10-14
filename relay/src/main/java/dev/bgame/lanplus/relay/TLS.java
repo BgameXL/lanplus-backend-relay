@@ -16,9 +16,9 @@ import java.util.ArrayList;
 import java.util.Base64;
 import java.util.List;
 
-final class Tls {
+final class TLS {
 
-    private Tls() {
+    private TLS() {
     }
 
     static SSLContext fromPem(RelayConfig cfg) throws Exception {

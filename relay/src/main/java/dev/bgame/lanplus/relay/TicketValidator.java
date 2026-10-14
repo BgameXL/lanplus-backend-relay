@@ -40,7 +40,7 @@ final class TicketValidator {
             if (resp.statusCode() != 200) {
                 return null;
             }
-            var json = Json.parse(resp.body());
+            var json = JSON.parse(resp.body());
             String domain = MinecraftHandshake.normalize(json.get("domain"));
             boolean requireToken = "true".equals(json.get("requireToken"));
             return domain == null ? null : new Result(domain, requireToken);

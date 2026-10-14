@@ -36,7 +36,7 @@ final class MinecraftListener {
             }
             table.noteVoiceIp(ip, host);
             String sid = table.addPending(player, hs.raw);
-            if (!host.send(Json.obj("type", "SESSION", "id", sid))) {
+            if (!host.send(JSON.obj("type", "SESSION", "id", sid))) {
                 table.claimPending(sid);
                 return;
             }

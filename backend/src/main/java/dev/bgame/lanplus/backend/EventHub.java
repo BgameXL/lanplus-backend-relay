@@ -35,21 +35,21 @@ final class EventHub {
         if (set == null || set.isEmpty()) {
             return;
         }
-        String json = Json.write(event);
+        String json = JSON.write(event);
         for (WebSocket ws : set) {
             ForkJoinPool.commonPool().execute(() -> sendOne(ws, json));
         }
     }
 
     void pingAll() {
-        String ping = Json.write(Map.of("type", "PING"));
+        String ping = JSON.write(Map.of("type", "PING"));
         for (WebSocket ws : userOf.keySet()) {
             ForkJoinPool.commonPool().execute(() -> sendOne(ws, ping));
         }
     }
 
     void sendAll(Object event) {
-        String json = Json.write(event);
+        String json = JSON.write(event);
         for (WebSocket ws : userOf.keySet()) {
             ForkJoinPool.commonPool().execute(() -> sendOne(ws, json));
         }

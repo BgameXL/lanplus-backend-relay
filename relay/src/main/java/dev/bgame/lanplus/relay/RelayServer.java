@@ -77,7 +77,7 @@ public final class RelayServer {
             s.setReuseAddress(true);
             return s;
         }
-        SSLContext ctx = Tls.fromPem(cfg);
+        SSLContext ctx = TLS.fromPem(cfg);
         SSLServerSocket s = (SSLServerSocket) ctx.getServerSocketFactory().createServerSocket();
         s.setReuseAddress(true);
         return s;

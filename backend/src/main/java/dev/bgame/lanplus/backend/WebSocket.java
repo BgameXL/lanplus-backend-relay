@@ -22,7 +22,7 @@ final class WebSocket {
         this.out = socket.getOutputStream();
     }
 
-    static WebSocket accept(Http.Request req, Socket socket) throws IOException {
+    static WebSocket accept(HTTP.Request req, Socket socket) throws IOException {
         String key = req.headers().get("sec-websocket-key");
         if (key == null) {
             throw new IOException("missing Sec-WebSocket-Key");

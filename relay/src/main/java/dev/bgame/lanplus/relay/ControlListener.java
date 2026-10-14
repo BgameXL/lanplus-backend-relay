@@ -30,7 +30,7 @@ final class ControlListener {
         try {
             socket.setTcpNoDelay(true);
             InputStream in = socket.getInputStream();
-            Map<String, String> msg = Json.parse(Io.readLine(in));
+            Map<String, String> msg = JSON.parse(IO.readLine(in));
             String type = msg.get("type");
             if ("HELLO".equals(type)) {
                 hello(socket, in, msg);
@@ -63,15 +63,15 @@ final class ControlListener {
         }
         if (cfg.voiceEnabled) {
             table.registerVoiceKey(session.voiceKey(), session);
-            session.send(Json.obj("type", "ASSIGNED", "domain", domain,
+            session.send(JSON.obj("type", "ASSIGNED", "domain", domain,
                     "voiceHost", cfg.advertisedVoiceHost(), "voiceKey", session.voiceKey()));
         } else {
-            session.send(Json.obj("type", "ASSIGNED", "domain", domain));
+            session.send(JSON.obj("type", "ASSIGNED", "domain", domain));
         }
         RelayServer.log("host assigned " + domain + (result.requireToken() ? " (gated)" : "")
                 + " (" + socket.getRemoteSocketAddress() + ")");
         try {
-            while (Io.readLine(in) != null) {
+            while (IO.readLine(in) != null) {
             }
         } finally {
             table.unregister(domain, session);
@@ -106,7 +106,7 @@ final class ControlListener {
 
     private static void reject(OutputStream out, String reason) {
         try {
-            out.write((Json.obj("type", "REJECTED", "reason", reason) + "\n").getBytes(StandardCharsets.UTF_8));
+            out.write((JSON.obj("type", "REJECTED", "reason", reason) + "\n").getBytes(StandardCharsets.UTF_8));
             out.flush();
         } catch (IOException ignored) {
         }

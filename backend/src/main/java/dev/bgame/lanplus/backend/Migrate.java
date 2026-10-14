@@ -31,7 +31,7 @@ public final class Migrate {
             return;
         }
 
-        Map<String, Object> root = Json.parseObject(Files.readString(jsonPath, StandardCharsets.UTF_8));
+        Map<String, Object> root = JSON.parseObject(Files.readString(jsonPath, StandardCharsets.UTF_8));
 
         Class.forName("org.sqlite.JDBC");
         try (Connection c = DriverManager.getConnection("jdbc:sqlite:" + dbPath)) {

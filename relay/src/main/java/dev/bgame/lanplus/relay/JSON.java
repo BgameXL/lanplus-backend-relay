@@ -3,9 +3,9 @@ package dev.bgame.lanplus.relay;
 import java.util.LinkedHashMap;
 import java.util.Map;
 
-final class Json {
+final class JSON {
 
-    private Json() {
+    private JSON() {
     }
 
     static String obj(String... kv) {

@@ -34,7 +34,7 @@ final class GuestTokenValidator {
             if (resp.statusCode() != 200) {
                 return null;
             }
-            String domain = Json.parse(resp.body()).get("domain");
+            String domain = JSON.parse(resp.body()).get("domain");
             return domain == null ? null : MinecraftHandshake.normalize(domain);
         } catch (Exception e) {
             RelayServer.log("guest token validation failed: " + e);

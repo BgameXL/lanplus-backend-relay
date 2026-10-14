@@ -84,7 +84,7 @@ final class CosmeticAssets {
             if (Files.size(f) > MAX_BYTES) {
                 return 0;
             }
-            Object p = Json.parseObject(Files.readString(f)).get("price");
+            Object p = JSON.parseObject(Files.readString(f)).get("price");
             if (p instanceof Number n) {
                 return Math.max(0, n.intValue());
             }

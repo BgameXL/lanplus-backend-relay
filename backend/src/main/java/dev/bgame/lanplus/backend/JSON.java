@@ -5,9 +5,9 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
-final class Json {
+final class JSON {
 
-    private Json() {
+    private JSON() {
     }
 
     // write

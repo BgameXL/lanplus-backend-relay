@@ -75,7 +75,7 @@ final class RoutingTable {
     }
 
     void pingAll() {
-        String ping = Json.obj("type", "PING");
+        String ping = JSON.obj("type", "PING");
         for (HostSession s : domains.values()) {
             s.send(ping);
         }

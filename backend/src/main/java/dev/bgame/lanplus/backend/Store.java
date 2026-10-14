@@ -454,7 +454,7 @@ final class Store {
                             + "WHERE u.username = ? COLLATE NOCASE AND u.banned = 0 LIMIT 1")) {
                 ps.setString(1, name);
                 try (ResultSet rs = ps.executeQuery()) {
-                    return rs.next() ? Json.parse(rs.getString(1)) : null;
+                    return rs.next() ? JSON.parse(rs.getString(1)) : null;
                 }
             } catch (SQLException e) {
                 throw fail("skinByName", e);
@@ -541,7 +541,7 @@ final class Store {
         }
         if (skin != null && !skin.equals(p.persistedSkin)) {
             p.persistedSkin = skin;
-            saveSkinRef(uuid, Json.write(skin), now);
+            saveSkinRef(uuid, JSON.write(skin), now);
         }
         if (!p.hosting) {
             p.hostingAnnounced = false;
@@ -642,7 +642,7 @@ final class Store {
                 "SELECT skin_json FROM user_skin WHERE uuid=?")) {
             ps.setString(1, uuid.toString());
             try (ResultSet rs = ps.executeQuery()) {
-                return rs.next() ? Json.parse(rs.getString(1)) : null;
+                return rs.next() ? JSON.parse(rs.getString(1)) : null;
             }
         }
     }
@@ -1547,7 +1547,7 @@ final class Store {
                         }
                         try (ResultSet rs = ps.executeQuery()) {
                             while (rs.next()) {
-                                Object persisted = Json.parse(rs.getString(2));
+                                Object persisted = JSON.parse(rs.getString(2));
                                 if (persisted != null) {
                                     persistedSkins.put(UUID.fromString(rs.getString(1)), persisted);
                                 }
@@ -2825,7 +2825,7 @@ final class Store {
             HttpRequest req = HttpRequest.newBuilder(URI.create(discordWebhook))
                     .timeout(Duration.ofSeconds(5))
                     .header("Content-Type", "application/json")
-                    .POST(HttpRequest.BodyPublishers.ofString(Json.write(payload), StandardCharsets.UTF_8))
+                    .POST(HttpRequest.BodyPublishers.ofString(JSON.write(payload), StandardCharsets.UTF_8))
                     .build();
             httpClient.sendAsync(req, HttpResponse.BodyHandlers.discarding())
                     .exceptionally(e -> {
@@ -3241,7 +3241,7 @@ final class Store {
             if (resp.statusCode() != 200) {
                 return null;
             }
-            Object id = Json.parseObject(resp.body()).get("id");
+            Object id = JSON.parseObject(resp.body()).get("id");
             return id instanceof String s ? uuidFromUndashed(s) : null;
         } catch (Exception e) {
             BackendServer.log("hasJoined check failed: " + e);

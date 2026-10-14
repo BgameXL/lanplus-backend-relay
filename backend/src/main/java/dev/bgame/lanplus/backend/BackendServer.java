@@ -106,7 +106,7 @@ public final class BackendServer {
             socket.setTcpNoDelay(true);
             socket.setSoTimeout(cfg.requestTimeoutMs);
             InputStream in = socket.getInputStream();
-            Http.Request req = Http.read(in);
+            HTTP.Request req = HTTP.read(in);
             if (req == null) {
                 socket.close();
                 return;
@@ -117,10 +117,10 @@ public final class BackendServer {
             }
             Resp r = route(req);
             if (r.raw != null) {
-                Http.writeBytes(socket.getOutputStream(), r.status, r.contentType, r.raw,
+                HTTP.writeBytes(socket.getOutputStream(), r.status, r.contentType, r.raw,
                         "public, max-age=300");
             } else {
-                Http.writeJson(socket.getOutputStream(), r.status, r.body);
+                HTTP.writeJson(socket.getOutputStream(), r.status, r.body);
             }
             socket.close();
         } catch (IOException e) {
@@ -145,7 +145,7 @@ public final class BackendServer {
     private static final Resp UNAUTHORIZED = new Resp(401, null);
     private static final Resp FORBIDDEN = new Resp(403, null);
 
-    private Resp route(Http.Request req) {
+    private Resp route(HTTP.Request req) {
         String m = req.method();
         String path = req.path();
         try {
@@ -368,8 +368,8 @@ public final class BackendServer {
     // auth
     private static final Pattern USERNAME = Pattern.compile("[A-Za-z0-9_]{1,16}");
 
-    private Resp authChallenge(Http.Request req) {
-        Map<String, Object> b = Json.parseObject(req.body());
+    private Resp authChallenge(HTTP.Request req) {
+        Map<String, Object> b = JSON.parseObject(req.body());
         String username = (String) b.get("username");
         if (username == null || !USERNAME.matcher(username).matches()) {
             return BAD;
@@ -377,8 +377,8 @@ public final class BackendServer {
         return ok(Map.of("serverId", store.newChallenge()));
     }
 
-    private Resp authVerify(Http.Request req) {
-        Map<String, Object> b = Json.parseObject(req.body());
+    private Resp authVerify(HTTP.Request req) {
+        Map<String, Object> b = JSON.parseObject(req.body());
         String username = (String) b.get("username");
         if (username == null || !USERNAME.matcher(username).matches()) {
             return UNAUTHORIZED;
@@ -387,11 +387,11 @@ public final class BackendServer {
         return r == null ? UNAUTHORIZED : ok(authBody(r));
     }
 
-    private Resp authOffline(Http.Request req) {
+    private Resp authOffline(HTTP.Request req) {
         if (!store.isOfflineAllowed()) {
             return FORBIDDEN;
         }
-        Map<String, Object> b = Json.parseObject(req.body());
+        Map<String, Object> b = JSON.parseObject(req.body());
         String username = (String) b.get("username");
         if (username == null || !USERNAME.matcher(username).matches()) {
             return BAD;
@@ -404,7 +404,7 @@ public final class BackendServer {
                 "verified", r.verified(), "expiresIn", r.expiresInSeconds());
     }
 
-    private static String bearer(Http.Request req) {
+    private static String bearer(HTTP.Request req) {
         String h = req.headers().get("authorization");
         if (h == null) {
             return null;
@@ -413,8 +413,8 @@ public final class BackendServer {
         return h.regionMatches(true, 0, "Bearer ", 0, 7) ? h.substring(7).trim() : null;
     }
 
-    private Resp presence(Http.Request req, UUID uuid) {
-        Map<String, Object> b = Json.parseObject(req.body());
+    private Resp presence(HTTP.Request req, UUID uuid) {
+        Map<String, Object> b = JSON.parseObject(req.body());
         boolean announceHosting = store.upsertPresence(uuid,
                 (String) b.get("username"), (String) b.get("state"), (String) b.get("worldName"),
                 (String) b.get("address"), (String) b.get("joinCode"), b.get("skin"),
@@ -494,8 +494,8 @@ public final class BackendServer {
         return out;
     }
 
-    private Resp friendsAdd(Http.Request req, UUID uuid) {
-        Map<String, Object> b = Json.parseObject(req.body());
+    private Resp friendsAdd(HTTP.Request req, UUID uuid) {
+        Map<String, Object> b = JSON.parseObject(req.body());
         UUID friendUuid = uuid((String) b.get("friendUuid"));
         Store.AddResult result = store.addFriendRequest(uuid, friendUuid);
         if (result == Store.AddResult.REQUESTED) {
@@ -506,8 +506,8 @@ public final class BackendServer {
         return ok(Map.of("success", result != Store.AddResult.BLOCKED));
     }
 
-    private Resp friendsRelation(Http.Request req, UUID uuid, String action) {
-        Map<String, Object> b = Json.parseObject(req.body());
+    private Resp friendsRelation(HTTP.Request req, UUID uuid, String action) {
+        Map<String, Object> b = JSON.parseObject(req.body());
         UUID target = uuid((String) b.get("targetUuid"));
         switch (action) {
             case "mute" -> store.setMuted(uuid, target, true);
@@ -521,20 +521,20 @@ public final class BackendServer {
         return ok(Map.of("success", true));
     }
 
-    private Resp friendsRemove(Http.Request req, UUID uuid) {
-        Map<String, Object> b = Json.parseObject(req.body());
+    private Resp friendsRemove(HTTP.Request req, UUID uuid) {
+        Map<String, Object> b = JSON.parseObject(req.body());
         store.removeFriend(uuid, uuid((String) b.get("friendUuid")));
         return ok(Map.of("success", true));
     }
 
-    private Resp friendsAccept(Http.Request req, UUID uuid) {
-        Map<String, Object> b = Json.parseObject(req.body());
+    private Resp friendsAccept(HTTP.Request req, UUID uuid) {
+        Map<String, Object> b = JSON.parseObject(req.body());
         store.acceptRequest(uuid, uuid((String) b.get("friendUuid")));
         return ok(Map.of("success", true));
     }
 
-    private Resp friendsDecline(Http.Request req, UUID uuid) {
-        Map<String, Object> b = Json.parseObject(req.body());
+    private Resp friendsDecline(HTTP.Request req, UUID uuid) {
+        Map<String, Object> b = JSON.parseObject(req.body());
         store.declineRequest(uuid, uuid((String) b.get("friendUuid")));
         return ok(Map.of("success", true));
     }
@@ -544,8 +544,8 @@ public final class BackendServer {
     private static final Pattern OBVIOUS_DOMAIN = Pattern.compile("(?<![\\w.])[a-z0-9-]+\\.[a-z]{2,24}(?![\\w])");
     private static final Pattern ADVANCEMENT_ID = Pattern.compile("[a-z0-9_./:-]{1,200}");
 
-    private Resp profileAdvancement(Http.Request req, UUID uuid) {
-        Map<String, Object> b = Json.parseObject(req.body());
+    private Resp profileAdvancement(HTTP.Request req, UUID uuid) {
+        Map<String, Object> b = JSON.parseObject(req.body());
         String advId = (String) b.get("advancementId");
         if (advId == null || !ADVANCEMENT_ID.matcher(advId = advId.trim()).matches()) {
             return ok(Map.of("success", false));
@@ -558,8 +558,8 @@ public final class BackendServer {
     private static final Set<String> REPORT_REASONS =
             Set.of("hate_speech", "harassment", "spam", "inappropriate", "other");
 
-    private Resp report(Http.Request req, UUID self) {
-        Map<String, Object> b = Json.parseObject(req.body());
+    private Resp report(HTTP.Request req, UUID self) {
+        Map<String, Object> b = JSON.parseObject(req.body());
         UUID target = uuid((String) b.get("targetUuid"));
         if (target.equals(self)) {
             return ok(error("bad_target"));
@@ -579,7 +579,7 @@ public final class BackendServer {
 
     private final ThreadLocal<String> auditActor = new ThreadLocal<>();
 
-    private Resp adminRoute(String m, String path, Http.Request req, String actor) {
+    private Resp adminRoute(String m, String path, HTTP.Request req, String actor) {
         auditActor.set(actor);
         try {
             return adminDispatch(m, path, req);
@@ -592,7 +592,7 @@ public final class BackendServer {
         store.addAudit(auditActor.get(), action, target, detail);
     }
 
-    private Resp adminDispatch(String m, String path, Http.Request req) {
+    private Resp adminDispatch(String m, String path, HTTP.Request req) {
         if (m.equals("GET") && path.equals("/admin/audit")) {
             return ok(store.listAudit(200));
         }
@@ -672,8 +672,8 @@ public final class BackendServer {
         return NOT_FOUND;
     }
 
-    private Resp adminDeleteAnnouncement(Http.Request req) {
-        Map<String, Object> b = Json.parseObject(req.body());
+    private Resp adminDeleteAnnouncement(HTTP.Request req) {
+        Map<String, Object> b = JSON.parseObject(req.body());
         if (!(b.get("id") instanceof Number n)) {
             return BAD;
         }
@@ -686,8 +686,8 @@ public final class BackendServer {
 
     private static final Set<String> ANNOUNCEMENT_TYPES = Set.of("UPDATE", "MAINTENANCE", "GENERAL", "FREE");
 
-    private Resp announcementsSeen(Http.Request req, UUID self) {
-        Map<String, Object> b = Json.parseObject(req.body());
+    private Resp announcementsSeen(HTTP.Request req, UUID self) {
+        Map<String, Object> b = JSON.parseObject(req.body());
         List<Integer> ids = new ArrayList<>();
         if (b.get("ids") instanceof List<?> list) {
             for (Object o : list) {
@@ -700,8 +700,8 @@ public final class BackendServer {
         return ok(ordered("success", true));
     }
 
-    private Resp adminAnnouncement(Http.Request req) {
-        Map<String, Object> b = Json.parseObject(req.body());
+    private Resp adminAnnouncement(HTTP.Request req) {
+        Map<String, Object> b = JSON.parseObject(req.body());
         String type = b.get("type") == null ? null : String.valueOf(b.get("type"));
         String title = b.get("title") == null ? null : String.valueOf(b.get("title"));
         String body = b.get("body") == null ? null : String.valueOf(b.get("body"));
@@ -728,8 +728,8 @@ public final class BackendServer {
         return ordered("type", "VERSION", "data", ordered("latest", latestVersion, "url", downloadUrl));
     }
 
-    private Resp adminLatestVersion(Http.Request req) {
-        Map<String, Object> b = Json.parseObject(req.body());
+    private Resp adminLatestVersion(HTTP.Request req) {
+        Map<String, Object> b = JSON.parseObject(req.body());
         if (!(b.get("version") instanceof String s) || s.isBlank()) {
             return ok(error("bad_version"));
         }
@@ -741,16 +741,16 @@ public final class BackendServer {
         return OK_EMPTY;
     }
 
-    private Resp adminTestNotification(Http.Request req) {
-        Map<String, Object> b = Json.parseObject(req.body());
+    private Resp adminTestNotification(HTTP.Request req) {
+        Map<String, Object> b = JSON.parseObject(req.body());
         String title = b.get("title") == null ? "Test notification" : String.valueOf(b.get("title"));
         String body = b.get("body") == null ? "" : String.valueOf(b.get("body"));
         hub.sendAll(ordered("type", "TEST_NOTIFICATION", "data", ordered("title", title, "body", body)));
         return OK_EMPTY;
     }
 
-    private Resp adminCosmeticUpload(Http.Request req) {
-        Map<String, Object> b = Json.parseObject(req.body());
+    private Resp adminCosmeticUpload(HTTP.Request req) {
+        Map<String, Object> b = JSON.parseObject(req.body());
         String id = b.get("id") == null ? null : String.valueOf(b.get("id"));
         if (!CosmeticAssets.validId(id)) {
             return ok(error("bad_id"));
@@ -795,7 +795,7 @@ public final class BackendServer {
         return ok(out);
     }
 
-    private Resp adminUser(Http.Request req) {
+    private Resp adminUser(HTTP.Request req) {
         UUID target = uuid(req.param("uuid"));
         if (target == null) {
             return BAD;
@@ -804,8 +804,8 @@ public final class BackendServer {
         return u == null ? NOT_FOUND : ok(u);
     }
 
-    private Resp adminImageDelete(AssetCatalog catalog, String label, Http.Request req) {
-        Map<String, Object> b = Json.parseObject(req.body());
+    private Resp adminImageDelete(AssetCatalog catalog, String label, HTTP.Request req) {
+        Map<String, Object> b = JSON.parseObject(req.body());
         String id = b.get("id") == null ? null : String.valueOf(b.get("id"));
         if (!AssetCatalog.validId(id)) {
             return ok(error("bad_id"));
@@ -818,8 +818,8 @@ public final class BackendServer {
         return ok(ordered("success", true));
     }
 
-    private Resp adminCosmeticDelete(Http.Request req) {
-        Map<String, Object> b = Json.parseObject(req.body());
+    private Resp adminCosmeticDelete(HTTP.Request req) {
+        Map<String, Object> b = JSON.parseObject(req.body());
         String id = b.get("id") == null ? null : String.valueOf(b.get("id"));
         if (!CosmeticAssets.validId(id)) {
             return ok(error("bad_id"));
@@ -832,8 +832,8 @@ public final class BackendServer {
         return ok(ordered("success", true));
     }
 
-    private Resp adminImageUpload(AssetCatalog catalog, String label, Http.Request req) {
-        Map<String, Object> b = Json.parseObject(req.body());
+    private Resp adminImageUpload(AssetCatalog catalog, String label, HTTP.Request req) {
+        Map<String, Object> b = JSON.parseObject(req.body());
         String id = b.get("id") == null ? null : String.valueOf(b.get("id"));
         if (!AssetCatalog.validId(id)) {
             return ok(error("bad_id"));
@@ -869,15 +869,15 @@ public final class BackendServer {
         return ok(ordered("id", id, "url", catalog.url(id), "hash", hash));
     }
 
-    private Resp adminScrub(Http.Request req) {
-        Map<String, Object> b = Json.parseObject(req.body());
+    private Resp adminScrub(HTTP.Request req) {
+        Map<String, Object> b = JSON.parseObject(req.body());
         store.scrubProfile(uuid((String) b.get("targetUuid")));
         audit("profile.scrub", String.valueOf(b.get("targetUuid")), null);
         return ok(Map.of("success", true));
     }
 
-    private Resp adminBan(Http.Request req) {
-        Map<String, Object> b = Json.parseObject(req.body());
+    private Resp adminBan(HTTP.Request req) {
+        Map<String, Object> b = JSON.parseObject(req.body());
         UUID target = uuid((String) b.get("targetUuid"));
         String reason = b.get("reason") == null ? null : String.valueOf(b.get("reason"));
         store.setBanned(target, true, reason);
@@ -886,8 +886,8 @@ public final class BackendServer {
         return ok(Map.of("success", true));
     }
 
-    private Resp adminUnban(Http.Request req) {
-        Map<String, Object> b = Json.parseObject(req.body());
+    private Resp adminUnban(HTTP.Request req) {
+        Map<String, Object> b = JSON.parseObject(req.body());
         UUID target = uuid((String) b.get("targetUuid"));
         store.setBanned(target, false, null);
         audit("unban", target.toString(), null);
@@ -895,8 +895,8 @@ public final class BackendServer {
         return ok(Map.of("success", true));
     }
 
-    private Resp adminResolveReport(Http.Request req) {
-        Map<String, Object> b = Json.parseObject(req.body());
+    private Resp adminResolveReport(HTTP.Request req) {
+        Map<String, Object> b = JSON.parseObject(req.body());
         Object idObj = b.get("id");
         long id = idObj instanceof Number n ? n.longValue() : Long.parseLong(String.valueOf(idObj));
         boolean resolved = store.resolveReport(id);
@@ -907,8 +907,8 @@ public final class BackendServer {
     private static final java.util.Set<String> COSMETIC_SLOTS = java.util.Set.of(
             "HEAD", "FACE", "BODY", "BACK", "WAIST", "LEGS", "MAIN_HAND", "OFF_HAND");
 
-    private Resp cosmeticEquip(Http.Request req, UUID self) {
-        Map<String, Object> b = Json.parseObject(req.body());
+    private Resp cosmeticEquip(HTTP.Request req, UUID self) {
+        Map<String, Object> b = JSON.parseObject(req.body());
         String slot = b.get("slot") == null ? null : String.valueOf(b.get("slot"));
         if (slot == null || !COSMETIC_SLOTS.contains(slot)) {
             return ok(error("bad_slot"));
@@ -923,8 +923,8 @@ public final class BackendServer {
         return ok(ordered("success", true));
     }
 
-    private Resp cosmeticPurchase(Http.Request req, UUID self) {
-        Map<String, Object> b = Json.parseObject(req.body());
+    private Resp cosmeticPurchase(HTTP.Request req, UUID self) {
+        Map<String, Object> b = JSON.parseObject(req.body());
         Object idObj = b.get("cosmeticId");
         String id = idObj == null ? null : String.valueOf(idObj);
         if (id == null || !CosmeticAssets.validId(id) || !cosmetics3d.has(id)) {
@@ -938,8 +938,8 @@ public final class BackendServer {
         return ok(ordered("success", true, "balance", shop.get("balance"), "owned", shop.get("owned")));
     }
 
-    private Resp profileUpdate(Http.Request req, UUID uuid) {
-        Map<String, Object> b = Json.parseObject(req.body());
+    private Resp profileUpdate(HTTP.Request req, UUID uuid) {
+        Map<String, Object> b = JSON.parseObject(req.body());
         store.ensureUser(uuid, null);
         if (b.containsKey("bio")) {
             String bio = b.get("bio") == null ? "" : String.valueOf(b.get("bio"));
@@ -1073,8 +1073,8 @@ public final class BackendServer {
     private static final int MAX_SKIN_PNG_BYTES = 32 * 1024;
     private static final int MAX_LIBRARY_SKINS = 10;
 
-    private Resp skinUpload(Http.Request req, UUID self) {
-        Map<String, Object> b = Json.parseObject(req.body());
+    private Resp skinUpload(HTTP.Request req, UUID self) {
+        Map<String, Object> b = JSON.parseObject(req.body());
         Object modelObj = b.get("model");
         String model = modelObj == null ? null : String.valueOf(modelObj);
         if (model != null && !model.equals("slim")) {
@@ -1149,8 +1149,8 @@ public final class BackendServer {
         return ok(ordered("active", active, "skins", skins));
     }
 
-    private Resp skinLibraryAdd(Http.Request req, UUID self) {
-        Map<String, Object> b = Json.parseObject(req.body());
+    private Resp skinLibraryAdd(HTTP.Request req, UUID self) {
+        Map<String, Object> b = JSON.parseObject(req.body());
         Object modelObj = b.get("model");
         String model = modelObj == null ? null : String.valueOf(modelObj);
         if (model != null && !model.equals("slim") && !model.equals("classic")) {
@@ -1224,8 +1224,8 @@ public final class BackendServer {
         return OBVIOUS_DOMAIN.matcher(t).find();
     }
 
-    private Resp inviteCreate(Http.Request req, UUID hostUuid) {
-        Map<String, Object> b = Json.parseObject(req.body());
+    private Resp inviteCreate(HTTP.Request req, UUID hostUuid) {
+        Map<String, Object> b = JSON.parseObject(req.body());
         boolean gated = Boolean.TRUE.equals(b.get("gated"));
         String code = store.createInvite(hostUuid, (String) b.get("address"), (String) b.get("worldName"), gated);
         Store.Invite inv = store.invite(code);
@@ -1252,8 +1252,8 @@ public final class BackendServer {
         return ok(r);
     }
 
-    private Resp relayTicket(Http.Request req, UUID uuid) {
-        Map<String, Object> b = Json.parseObject(req.body());
+    private Resp relayTicket(HTTP.Request req, UUID uuid) {
+        Map<String, Object> b = JSON.parseObject(req.body());
         boolean gated = Boolean.TRUE.equals(b.get("gated"));
         Object[] minted = store.mintTicketToken(uuid, gated);
         String token = (String) minted[0];
@@ -1267,7 +1267,7 @@ public final class BackendServer {
                 "expiresIn", 3600));
     }
 
-    private Resp relayValidate(Http.Request req) {
+    private Resp relayValidate(HTTP.Request req) {
         Store.Ticket ticket = store.validateTicket(req.param("ticket"));
         if (ticket == null) {
             return new Resp(401, null);
@@ -1276,7 +1276,7 @@ public final class BackendServer {
                 "requireToken", ticket.requireToken()));
     }
 
-    private Resp relayGuestValidate(Http.Request req) {
+    private Resp relayGuestValidate(HTTP.Request req) {
         String domain = store.validateGuestToken(req.param("token"));
         if (domain == null) {
             return new Resp(401, null);
@@ -1285,13 +1285,13 @@ public final class BackendServer {
     }
 
     // WebSocket events
-    private void serveEvents(Socket socket, Http.Request req) {
+    private void serveEvents(Socket socket, HTTP.Request req) {
         WebSocket ws = null;
         try {
             ws = WebSocket.accept(req, socket);
             String message;
             while ((message = ws.readText()) != null) {
-                Map<String, Object> m = Json.parseObject(message);
+                Map<String, Object> m = JSON.parseObject(message);
                 if ("AUTH".equals(m.get("type"))) {
                     Store.Session session = store.validateSession((String) m.get("token"));
                     if (session == null) {
@@ -1299,7 +1299,7 @@ public final class BackendServer {
                     }
                     hub.register(session.uuid(), ws);
                     if (!latestVersion.isBlank()) {
-                        ws.sendText(Json.write(versionEvent()));
+                        ws.sendText(JSON.write(versionEvent()));
                     }
                     log("ws auth " + session.uuid());
                 }

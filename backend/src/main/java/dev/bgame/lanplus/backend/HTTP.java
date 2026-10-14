@@ -9,11 +9,11 @@ import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
 import java.util.Map;
 
-final class Http {
+final class HTTP {
 
     private static final int MAX_BODY = 8 * 1024 * 1024;
 
-    private Http() {
+    private HTTP() {
     }
 
     record Request(String method, String path, String query, Map<String, String> headers, String body) {
@@ -106,7 +106,7 @@ final class Http {
     }
 
     static void writeJson(OutputStream out, int status, Object body) throws IOException {
-        byte[] payload = (body == null ? "" : Json.write(body)).getBytes(StandardCharsets.UTF_8);
+        byte[] payload = (body == null ? "" : JSON.write(body)).getBytes(StandardCharsets.UTF_8);
         writeBytes(out, status, "application/json", payload, null);
     }
 

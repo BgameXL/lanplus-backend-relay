@@ -5,9 +5,9 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 
-final class Io {
+final class IO {
 
-    private Io() {
+    private IO() {
     }
 
     static String readLine(InputStream in) throws IOException {
