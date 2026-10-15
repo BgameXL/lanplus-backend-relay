@@ -55,7 +55,7 @@ final class ControlListener {
             return;
         }
         String domain = result.domain();
-        HostSession session = new HostSession(socket, domain, result.requireToken(), voiceRelay);
+        HostSession session = new HostSession(socket, domain, result.requireToken(), result.mode(), voiceRelay);
         if (!table.register(domain, session)) {
             reject(out, "domain busy");
             Pump.closeQuietly(socket);

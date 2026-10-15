@@ -40,3 +40,4 @@ next-app
 *.db
 staging
 deploy-backend.sh
+deploy-relay.sh

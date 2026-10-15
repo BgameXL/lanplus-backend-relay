@@ -19,6 +19,7 @@ final class HostSession {
     private final OutputStream out;
     private final String domain;
     private final boolean requireToken;
+    private final String mode;
     private final String voiceKey = UUID.randomUUID().toString();
     private final VoiceRelay voiceRelay;
 
@@ -30,11 +31,13 @@ final class HostSession {
     private volatile DataOutputStream voiceOut;
     private volatile boolean warnedNoVoice;
 
-    HostSession(Socket control, String domain, boolean requireToken, VoiceRelay voiceRelay) throws IOException {
+    HostSession(Socket control, String domain, boolean requireToken, String mode, VoiceRelay voiceRelay)
+            throws IOException {
         this.control = control;
         this.out = control.getOutputStream();
         this.domain = domain;
         this.requireToken = requireToken;
+        this.mode = mode;
         this.voiceRelay = voiceRelay;
     }
 
@@ -44,6 +47,10 @@ final class HostSession {
 
     boolean requireToken() {
         return requireToken;
+    }
+
+    String mode() {
+        return mode;
     }
 
     String voiceKey() {

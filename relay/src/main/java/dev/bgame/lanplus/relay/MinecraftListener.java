@@ -7,6 +7,8 @@ import java.net.Socket;
 
 final class MinecraftListener {
 
+    private static final int REJECT_TIMEOUT_MS = 5000;
+
     private final RoutingTable table;
     private final RateLimiter limiter;
     private final GuestTokenValidator guestTokens;
@@ -30,13 +32,19 @@ final class MinecraftListener {
             if (hs == null || hs.serverAddress == null) {
                 return;
             }
-            HostSession host = route(hs.serverAddress);
-            if (host == null) {
+            RouteResult routed = route(hs.serverAddress);
+            if (routed.denied) {
+                String mode = routed.host == null ? null : routed.host.mode();
+                player.setSoTimeout(REJECT_TIMEOUT_MS);
+                MinecraftReject.send(player, hs.nextState, hs.protocolVersion, motdJson(mode), kickJson(mode));
                 return;
             }
-            table.noteVoiceIp(ip, host);
+            if (routed.host == null) {
+                return;
+            }
+            table.noteVoiceIp(ip, routed.host);
             String sid = table.addPending(player, hs.raw);
-            if (!host.send(JSON.obj("type", "SESSION", "id", sid))) {
+            if (!routed.host.send(JSON.obj("type", "SESSION", "id", sid))) {
                 table.claimPending(sid);
                 return;
             }
@@ -49,14 +57,46 @@ final class MinecraftListener {
         }
     }
 
-    private HostSession route(String serverAddress) {
+    private record RouteResult(HostSession host, boolean denied) {
+    }
+
+    private RouteResult route(String serverAddress) {
         HostSession direct = table.lookup(serverAddress);
         if (direct != null) {
-            return direct.requireToken() ? null : direct;
+            if (!direct.requireToken() || "EVERYONE".equals(direct.mode())) {
+                return new RouteResult(direct, false);
+            }
+            return new RouteResult(direct, true);
         }
         int dot = serverAddress.indexOf('.');
         String token = dot < 0 ? serverAddress : serverAddress.substring(0, dot);
         String domain = guestTokens.validate(token);
-        return domain == null ? null : table.lookup(domain);
+        HostSession viaToken = domain == null ? null : table.lookup(domain);
+        return new RouteResult(viaToken, false);
+    }
+
+    private static String modeLabel(String mode) {
+        return switch (mode == null ? "" : mode) {
+            case "FRIENDS" -> "Friends only";
+            case "FRIENDS_OF_FRIENDS" -> "Friends of friends";
+            case "INVITED" -> "Invite only";
+            default -> "Private world";
+        };
+    }
+
+    private static String motdJson(String mode) {
+        return "{\"text\":\"\",\"extra\":[{\"text\":\"LAN+\",\"color\":\"green\",\"bold\":true},"
+                + "{\"text\":\" \\u00b7 \",\"color\":\"dark_gray\"},"
+                + "{\"text\":\"" + modeLabel(mode) + "\",\"color\":\"yellow\"}]}";
+    }
+
+    private static String kickJson(String mode) {
+        String reason = switch (mode == null ? "" : mode) {
+            case "FRIENDS" -> "This LAN+ world is open to the host's friends only.";
+            case "FRIENDS_OF_FRIENDS" -> "This LAN+ world is open to the host's friends and their friends only.";
+            case "INVITED" -> "This LAN+ world is invite-only.";
+            default -> "This LAN+ world is private.";
+        };
+        return "{\"text\":\"" + reason + " Ask the host for an invite to join.\",\"color\":\"red\"}";
     }
 }

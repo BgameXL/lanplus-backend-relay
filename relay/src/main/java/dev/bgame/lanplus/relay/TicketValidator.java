@@ -10,7 +10,7 @@ import java.time.Duration;
 
 final class TicketValidator {
 
-    record Result(String domain, boolean requireToken) {
+    record Result(String domain, boolean requireToken, String mode) {
     }
 
     private final RelayConfig cfg;
@@ -24,7 +24,7 @@ final class TicketValidator {
 
     Result validate(String ticket) {
         if (cfg.noAuth) {
-            return new Result(Wordlist.randomDomain(cfg.baseDomain), false);
+            return new Result(Wordlist.randomDomain(cfg.baseDomain), false, "EVERYONE");
         }
         if (ticket == null || ticket.isBlank()) {
             return null;
@@ -43,7 +43,8 @@ final class TicketValidator {
             var json = JSON.parse(resp.body());
             String domain = MinecraftHandshake.normalize(json.get("domain"));
             boolean requireToken = "true".equals(json.get("requireToken"));
-            return domain == null ? null : new Result(domain, requireToken);
+            String mode = json.get("mode");
+            return domain == null ? null : new Result(domain, requireToken, mode);
         } catch (Exception e) {
             RelayServer.log("ticket validation failed: " + e);
             return null;

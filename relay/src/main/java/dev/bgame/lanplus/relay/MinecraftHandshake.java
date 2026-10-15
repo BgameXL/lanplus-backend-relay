@@ -14,11 +14,13 @@ final class MinecraftHandshake {
     final byte[] raw;
     final String serverAddress;
     final int nextState;
+    final int protocolVersion;
 
-    private MinecraftHandshake(byte[] raw, String serverAddress, int nextState) {
+    private MinecraftHandshake(byte[] raw, String serverAddress, int nextState, int protocolVersion) {
         this.raw = raw;
         this.serverAddress = serverAddress;
         this.nextState = nextState;
+        this.protocolVersion = protocolVersion;
     }
 
     static MinecraftHandshake read(InputStream in) throws IOException {
@@ -46,13 +48,14 @@ final class MinecraftHandshake {
         ByteArrayInputStream b = new ByteArrayInputStream(body);
         String addr = null;
         int nextState = -1;
+        int protocol = -1;
         if (readVarInt(b, null) == 0x00) {
-            readVarInt(b, null);
+            protocol = readVarInt(b, null);
             addr = normalize(readString(b));
             skipFully(b, 2);
             nextState = readVarInt(b, null);
         }
-        return new MinecraftHandshake(raw.toByteArray(), addr, nextState);
+        return new MinecraftHandshake(raw.toByteArray(), addr, nextState, protocol);
     }
 
     static String normalize(String host) {

@@ -77,7 +77,7 @@ final class Store {
         volatile boolean disconnectRecorded;
     }
 
-    record Ticket(UUID uuid, String domain, boolean requireToken, long expiresAt) {
+    record Ticket(UUID uuid, String domain, boolean requireToken, String mode, long expiresAt) {
     }
 
     record Invite(UUID hostUuid, String address, String worldName, long expiresAt) {
@@ -3060,10 +3060,10 @@ final class Store {
     }
 
     // relay tickets
-    Object[] mintTicketToken(UUID uuid, boolean gated) {
+    Object[] mintTicketToken(UUID uuid, boolean gated, String mode) {
         User u = ensureUser(uuid, null);
         String token = randomHex(32);
-        Ticket t = new Ticket(uuid, u.domain, gated, System.currentTimeMillis() + 3_600_000);
+        Ticket t = new Ticket(uuid, u.domain, gated, mode, System.currentTimeMillis() + 3_600_000);
         tickets.put(token, t);
         return new Object[]{token, t};
     }

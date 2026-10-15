@@ -1255,7 +1255,7 @@ public final class BackendServer {
     private Resp relayTicket(HTTP.Request req, UUID uuid) {
         Map<String, Object> b = JSON.parseObject(req.body());
         boolean gated = Boolean.TRUE.equals(b.get("gated"));
-        Object[] minted = store.mintTicketToken(uuid, gated);
+        Object[] minted = store.mintTicketToken(uuid, gated, (String) b.get("mode"));
         String token = (String) minted[0];
         Store.Ticket ticket = (Store.Ticket) minted[1];
         log("relay ticket issued for " + ticket.uuid() + " -> " + ticket.domain() + (gated ? " (gated)" : ""));
@@ -1273,7 +1273,7 @@ public final class BackendServer {
             return new Resp(401, null);
         }
         return ok(ordered("uuid", ticket.uuid().toString(), "domain", ticket.domain(),
-                "requireToken", ticket.requireToken()));
+                "requireToken", ticket.requireToken(), "mode", ticket.mode() == null ? "" : ticket.mode()));
     }
 
     private Resp relayGuestValidate(HTTP.Request req) {
