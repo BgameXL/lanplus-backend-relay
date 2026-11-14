@@ -1756,8 +1756,8 @@ final class Store {
 
     static final int MAX_PROMPTS = 3;
     private static final String[] PROMPT_IDS =
-            {"delete_block", "first_night", "build_first", "useless_item",
-                    "difficulty", "travel", "armor", "playstyle"};
+            {"dumb_death", "join_world", "armor", "vanilla_mod", "fav_version",
+                    "solo_or_friends", "gamemode", "too_many_mods", "three_mods", "unused_mechanic"};
 
     boolean isPromptId(String id) {
         for (String p : PROMPT_IDS) {
