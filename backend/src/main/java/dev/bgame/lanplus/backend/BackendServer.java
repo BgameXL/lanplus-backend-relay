@@ -529,8 +529,7 @@ public final class BackendServer {
 
     private Resp friendsAccept(HTTP.Request req, UUID uuid) {
         Map<String, Object> b = JSON.parseObject(req.body());
-        store.acceptRequest(uuid, uuid((String) b.get("friendUuid")));
-        return ok(Map.of("success", true));
+        return ok(Map.of("success", store.acceptRequest(uuid, uuid((String) b.get("friendUuid")))));
     }
 
     private Resp friendsDecline(HTTP.Request req, UUID uuid) {
@@ -917,8 +916,10 @@ public final class BackendServer {
         String id = idObj == null ? null : String.valueOf(idObj);
         if (id == null || id.isBlank()) {
             store.clearCosmetic(self, slot);
-        } else {
-            store.setCosmetic(self, slot, id);
+        } else if (!CosmeticAssets.validId(id) || !cosmetics3d.has(id)) {
+            return ok(error("bad_cosmetic"));
+        } else if (!store.equipCosmetic(self, slot, id)) {
+            return ok(error("not_owned"));
         }
         return ok(ordered("success", true));
     }

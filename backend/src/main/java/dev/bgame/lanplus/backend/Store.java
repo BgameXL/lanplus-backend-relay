@@ -1166,6 +1166,9 @@ final class Store {
     boolean acceptRequest(UUID uuid, UUID friendUuid) {
         synchronized (lock) {
             try {
+                if (!requestExists(friendUuid, uuid)) {
+                    return false;
+                }
                 return acceptRequestLocked(uuid, friendUuid);
             } catch (SQLException e) {
                 throw fail("acceptRequest", e);
@@ -1372,19 +1375,25 @@ final class Store {
         return out;
     }
 
-    void setCosmetic(UUID uuid, String slot, String cosmeticId) {
+    boolean equipCosmetic(UUID uuid, String slot, String cosmeticId) {
         synchronized (lock) {
-            try (PreparedStatement ps = conn().prepareStatement(
-                    "INSERT INTO cosmetic_loadout (uuid, slot, cosmetic_id, equipped_at) VALUES (?,?,?,?) "
-                            + "ON CONFLICT(uuid, slot) DO UPDATE SET cosmetic_id=excluded.cosmetic_id, "
-                            + "equipped_at=excluded.equipped_at")) {
-                ps.setString(1, uuid.toString());
-                ps.setString(2, slot);
-                ps.setString(3, cosmeticId);
-                ps.setLong(4, System.currentTimeMillis());
-                ps.executeUpdate();
+            try {
+                if (!ownsCosmeticLocked(uuid, cosmeticId)) {
+                    return false;
+                }
+                try (PreparedStatement ps = conn().prepareStatement(
+                        "INSERT INTO cosmetic_loadout (uuid, slot, cosmetic_id, equipped_at) VALUES (?,?,?,?) "
+                                + "ON CONFLICT(uuid, slot) DO UPDATE SET cosmetic_id=excluded.cosmetic_id, "
+                                + "equipped_at=excluded.equipped_at")) {
+                    ps.setString(1, uuid.toString());
+                    ps.setString(2, slot);
+                    ps.setString(3, cosmeticId);
+                    ps.setLong(4, System.currentTimeMillis());
+                    ps.executeUpdate();
+                    return true;
+                }
             } catch (SQLException e) {
-                throw fail("setCosmetic", e);
+                throw fail("equipCosmetic", e);
             }
         }
     }
@@ -1406,7 +1415,9 @@ final class Store {
         Map<String, Object> out = new LinkedHashMap<>();
         try (Reader r = read()) {
             try (PreparedStatement ps = conn().prepareStatement(
-                    "SELECT slot, cosmetic_id FROM cosmetic_loadout WHERE uuid=?")) {
+                    "SELECT l.slot, l.cosmetic_id FROM cosmetic_loadout l "
+                            + "JOIN cosmetic_ownership o ON o.uuid=l.uuid AND o.cosmetic_id=l.cosmetic_id "
+                            + "WHERE l.uuid=?")) {
                 ps.setString(1, uuid.toString());
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {

@@ -26,6 +26,10 @@ dependencies {
     // sqlite-jdbc pulls slf4j-api transitively; bind it to NOP so the backend's stdout stays clean
     // (no "Failed to load StaticLoggerBinder" noise). The backend logs via System.out itself.
     runtimeOnly 'org.slf4j:slf4j-nop:1.7.36'
+
+    testImplementation platform('org.junit:junit-bom:5.11.4')
+    testImplementation 'org.junit.jupiter:junit-jupiter'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
 }
 
 // Fat jar: bundle sqlite-jdbc (and its native libraries) so `java -jar` stays standalone.
@@ -45,4 +49,8 @@ tasks.named('jar', Jar).configure {
 
 tasks.withType(JavaCompile).configureEach {
     options.encoding = 'UTF-8'
+}
+
+tasks.named('test') {
+    useJUnitPlatform()
 }
