@@ -8,22 +8,9 @@ import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.SecureRandom;
-import java.sql.Connection;
-import java.sql.DriverManager;
-import java.sql.PreparedStatement;
-import java.sql.ResultSet;
-import java.sql.SQLException;
-import java.sql.Statement;
+import java.sql.*;
 import java.time.Duration;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.LinkedHashMap;
-import java.util.LinkedHashSet;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
-import java.util.UUID;
+import java.util.*;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
@@ -451,7 +438,8 @@ final class Store {
         try (Reader r = read()) {
             try (PreparedStatement ps = conn().prepareStatement(
                     "SELECT s.skin_json FROM users u JOIN user_skin s ON s.uuid = u.uuid "
-                            + "WHERE u.username = ? COLLATE NOCASE AND u.banned = 0 LIMIT 1")) {
+                            + "WHERE u.username = ? COLLATE NOCASE AND u.banned = 0 "
+                            + "ORDER BY s.updated_at DESC, u.uuid ASC LIMIT 1")) {
                 ps.setString(1, name);
                 try (ResultSet rs = ps.executeQuery()) {
                     return rs.next() ? JSON.parse(rs.getString(1)) : null;
