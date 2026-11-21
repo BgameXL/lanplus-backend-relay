@@ -102,11 +102,15 @@ public final class BackendServer {
     }
 
     private void handle(Socket socket) {
+        long startedAt = System.nanoTime();
+        HTTP.Request req = null;
+        int status = 0;
+        boolean ioFailed = false;
         try {
             socket.setTcpNoDelay(true);
             socket.setSoTimeout(cfg.requestTimeoutMs);
             InputStream in = socket.getInputStream();
-            HTTP.Request req = HTTP.read(in);
+            req = HTTP.read(in);
             if (req == null) {
                 socket.close();
                 return;
@@ -116,6 +120,7 @@ public final class BackendServer {
                 return;
             }
             Resp r = route(req);
+            status = r.status;
             if (r.raw != null) {
                 HTTP.writeBytes(socket.getOutputStream(), r.status, r.contentType, r.raw,
                         "public, max-age=300");
@@ -124,7 +129,16 @@ public final class BackendServer {
             }
             socket.close();
         } catch (IOException e) {
+            ioFailed = true;
             close(socket);
+        } finally {
+            if (req != null && !req.path().equals("/events")) {
+                long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt);
+                if (elapsedMs >= 1_000) {
+                    log("slow request " + req.method() + " " + req.path() + " -> "
+                            + (ioFailed || status == 0 ? "io_error" : status) + " in " + elapsedMs + "ms");
+                }
+            }
         }
     }
 
@@ -1288,25 +1302,46 @@ public final class BackendServer {
     // WebSocket events
     private void serveEvents(Socket socket, HTTP.Request req) {
         WebSocket ws = null;
+        UUID authenticated = null;
+        String closeReason = "handshake_failed";
         try {
             ws = WebSocket.accept(req, socket);
-            String message;
-            while ((message = ws.readText()) != null) {
-                Map<String, Object> m = JSON.parseObject(message);
-                if ("AUTH".equals(m.get("type"))) {
-                    Store.Session session = store.validateSession((String) m.get("token"));
-                    if (session == null) {
-                        break;
-                    }
-                    hub.register(session.uuid(), ws);
-                    if (!latestVersion.isBlank()) {
-                        ws.sendText(JSON.write(versionEvent()));
-                    }
-                    log("ws auth " + session.uuid());
-                }
+            closeReason = "closed_before_auth";
+            String message = ws.readText();
+            if (message == null) {
+                return;
             }
-        } catch (IOException | RuntimeException e) {
+            Map<String, Object> auth = JSON.parseObject(message);
+            if (!"AUTH".equals(auth.get("type"))) {
+                closeReason = "expected_auth";
+                return;
+            }
+            Store.Session session = store.validateSession((String) auth.get("token"));
+            if (session == null) {
+                closeReason = "auth_rejected";
+                return;
+            }
+            authenticated = session.uuid();
+            hub.register(authenticated, ws);
+            ws.sendText(JSON.write(Map.of("type", "AUTH_OK")));
+            if (!latestVersion.isBlank()) {
+                ws.sendText(JSON.write(versionEvent()));
+            }
+            log("ws auth " + authenticated);
+
+            closeReason = "client_closed";
+            while (ws.readText() != null) {
+                // Text PONGs keep the read timeout alive
+            }
+        } catch (SocketTimeoutException e) {
+            closeReason = "read_timeout";
+        } catch (IOException e) {
+            closeReason = "io_" + e.getClass().getSimpleName();
+        } catch (RuntimeException e) {
+            closeReason = "runtime_" + e.getClass().getSimpleName();
         } finally {
+            log("ws close " + (authenticated == null ? "unauthenticated" : authenticated)
+                    + " reason=" + closeReason);
             if (ws != null) {
                 hub.unregister(ws);
                 ws.close();

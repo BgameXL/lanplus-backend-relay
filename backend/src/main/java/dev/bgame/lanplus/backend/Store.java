@@ -3250,6 +3250,7 @@ final class Store {
                     .build();
             HttpResponse<String> resp = httpClient.send(req, HttpResponse.BodyHandlers.ofString());
             if (resp.statusCode() != 200) {
+                BackendServer.log("hasJoined returned HTTP " + resp.statusCode() + " for " + username);
                 return null;
             }
             Object id = JSON.parseObject(resp.body()).get("id");
