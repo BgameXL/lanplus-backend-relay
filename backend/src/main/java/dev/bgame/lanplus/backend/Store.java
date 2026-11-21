@@ -2927,6 +2927,7 @@ final class Store {
                 throw fail("adminUser", e);
             }
             try {
+                out.put("bio", scalar("SELECT text FROM profile_bio WHERE uuid=?", uuid));
                 long xp = totalXpLocked(uuid);
                 out.put("xp", xp);
                 out.put("tier", tierFor(xp));
