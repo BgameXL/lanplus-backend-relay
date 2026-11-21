@@ -7,6 +7,7 @@ import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.util.Base64;
+import java.util.concurrent.locks.ReentrantLock;
 
 final class WebSocket {
 
@@ -15,6 +16,7 @@ final class WebSocket {
     private final Socket socket;
     private final InputStream in;
     private final OutputStream out;
+    private final ReentrantLock writeLock = new ReentrantLock();
 
     private WebSocket(Socket socket) throws IOException {
         this.socket = socket;
@@ -98,23 +100,28 @@ final class WebSocket {
         }
     }
 
-    private synchronized void sendFrame(int opcode, byte[] payload) throws IOException {
-        out.write(0x80 | opcode);
-        int n = payload.length;
-        if (n < 126) {
-            out.write(n);
-        } else if (n < 65536) {
-            out.write(126);
-            out.write((n >> 8) & 0xFF);
-            out.write(n & 0xFF);
-        } else {
-            out.write(127);
-            for (int i = 7; i >= 0; i--) {
-                out.write((int) (((long) n >> (8 * i)) & 0xFF));
+    private void sendFrame(int opcode, byte[] payload) throws IOException {
+        writeLock.lock();
+        try {
+            out.write(0x80 | opcode);
+            int n = payload.length;
+            if (n < 126) {
+                out.write(n);
+            } else if (n < 65536) {
+                out.write(126);
+                out.write((n >> 8) & 0xFF);
+                out.write(n & 0xFF);
+            } else {
+                out.write(127);
+                for (int i = 7; i >= 0; i--) {
+                    out.write((int) (((long) n >> (8 * i)) & 0xFF));
+                }
             }
+            out.write(payload);
+            out.flush();
+        } finally {
+            writeLock.unlock();
         }
-        out.write(payload);
-        out.flush();
     }
 
     private int read1() throws IOException {
