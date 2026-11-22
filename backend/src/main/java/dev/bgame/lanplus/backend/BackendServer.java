@@ -146,6 +146,8 @@ public final class BackendServer {
     private static final Resp BAD = new Resp(400, null);
     private static final Resp UNAUTHORIZED = new Resp(401, null);
     private static final Resp FORBIDDEN = new Resp(403, null);
+    private static final Resp SESSION_SERVER_DOWN =
+            new Resp(503, ordered("success", false, "error", "session_server_unavailable", "retryAfterSeconds", 2));
 
     private Resp route(HTTP.Request req) {
         String m = req.method();
@@ -385,8 +387,12 @@ public final class BackendServer {
         if (username == null || !USERNAME.matcher(username).matches()) {
             return UNAUTHORIZED;
         }
-        Store.AuthResult r = store.authVerify(username, (String) b.get("serverId"));
-        return r == null ? UNAUTHORIZED : ok(authBody(r));
+        try {
+            Store.AuthResult r = store.authVerify(username, (String) b.get("serverId"));
+            return r == null ? UNAUTHORIZED : ok(authBody(r));
+        } catch (Store.SessionServerUnavailable e) {
+            return SESSION_SERVER_DOWN;
+        }
     }
 
     private Resp authOffline(HTTP.Request req) {

@@ -138,6 +138,7 @@ final class HTTP {
             case 401 -> "Unauthorized";
             case 403 -> "Forbidden";
             case 404 -> "Not Found";
+            case 503 -> "Service Unavailable";
             default -> "OK";
         };
     }

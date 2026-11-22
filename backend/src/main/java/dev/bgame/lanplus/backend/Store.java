@@ -3225,29 +3225,49 @@ final class Store {
         return new AuthResult(token, uuid, verified, sessionTtlMs / 1000);
     }
 
+    private static final int MOJANG_ATTEMPTS = 2;
+    private static final Duration MOJANG_TIMEOUT = Duration.ofSeconds(4);
+    private static final long MOJANG_RETRY_BACKOFF_MS = 250;
+
+    static final class SessionServerUnavailable extends RuntimeException {
+    }
+
     private UUID mojangHasJoined(String username, String serverId) {
         if (username == null || username.isBlank()) {
             return null;
         }
-        try {
-            String url = sessionServerUrl + "/session/minecraft/hasJoined?username="
-                    + URLEncoder.encode(username, StandardCharsets.UTF_8)
-                    + "&serverId=" + URLEncoder.encode(serverId, StandardCharsets.UTF_8);
-            HttpRequest req = HttpRequest.newBuilder(URI.create(url))
-                    .timeout(Duration.ofSeconds(5))
-                    .GET()
-                    .build();
-            HttpResponse<String> resp = httpClient.send(req, HttpResponse.BodyHandlers.ofString());
-            if (resp.statusCode() != 200) {
-                BackendServer.log("hasJoined returned HTTP " + resp.statusCode() + " for " + username);
-                return null;
+        String url = sessionServerUrl + "/session/minecraft/hasJoined?username="
+                + URLEncoder.encode(username, StandardCharsets.UTF_8)
+                + "&serverId=" + URLEncoder.encode(serverId, StandardCharsets.UTF_8);
+        HttpRequest req = HttpRequest.newBuilder(URI.create(url))
+                .timeout(MOJANG_TIMEOUT)
+                .GET()
+                .build();
+        for (int attempt = 1; attempt <= MOJANG_ATTEMPTS; attempt++) {
+            try {
+                HttpResponse<String> resp = httpClient.send(req, HttpResponse.BodyHandlers.ofString());
+                int code = resp.statusCode();
+                if (code == 200) {
+                    Object id = JSON.parseObject(resp.body()).get("id");
+                    return id instanceof String s ? uuidFromUndashed(s) : null;
+                }
+                if (code == 204) {
+                    return null;
+                }
+                BackendServer.log("hasJoined returned HTTP " + code + " for " + username);
+            } catch (Exception e) {
+                BackendServer.log("hasJoined check failed (attempt " + attempt + "): " + e);
             }
-            Object id = JSON.parseObject(resp.body()).get("id");
-            return id instanceof String s ? uuidFromUndashed(s) : null;
-        } catch (Exception e) {
-            BackendServer.log("hasJoined check failed: " + e);
-            return null;
+            if (attempt < MOJANG_ATTEMPTS) {
+                try {
+                    Thread.sleep(MOJANG_RETRY_BACKOFF_MS);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
         }
+        throw new SessionServerUnavailable();
     }
 
     private static UUID uuidFromUndashed(String s) {
